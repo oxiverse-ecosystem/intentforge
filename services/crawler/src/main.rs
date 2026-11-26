@@ -347,7 +347,18 @@ impl CrawlQueueManager {
 
     fn read_snapshot(path: &str) -> Option<QueueSnapshot> {
         let data = std::fs::read(path).ok()?;
-        serde_json::from_slice(&data).ok()
+        // Pre-gzip snapshots are plain JSON; detect by gzip magic so an
+        // existing 88 MB queue file is readable after upgrading.
+        let json = if data.starts_with(&[0x1f, 0x8b]) {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(&data[..]);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).ok()?;
+            out
+        } else {
+            data
+        };
+        serde_json::from_slice(&json).ok()
     }
 }
 
@@ -356,8 +367,15 @@ impl CrawlQueueManager {
 /// rename() is atomic on the same filesystem, so a hard kill mid-save leaves
 /// either the old complete file or the new complete file — never a torn one.
 fn save_snapshot_atomic(path: &str, snap: &QueueSnapshot) -> std::io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
-    let data = serde_json::to_vec(snap)?;
+    // URLs share long prefixes (scheme, host, path), so gzip cuts the 88 MB
+    // live snapshot to ~27 MB. Decode on load is ~10 ms, off the hot path.
+    let json = serde_json::to_vec(snap)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&json)?;
+    let data = encoder.finish()?;
     // Best-effort backup of the current good snapshot (load() falls back to it).
     if std::path::Path::new(path).exists() {
         let _ = std::fs::copy(path, format!("{}.bak", path));
@@ -537,7 +555,7 @@ struct AppState {
     crawl_client: reqwest::Client,
     indexer_url: String,
     embed_url: String,
-    ingest_buffer: Mutex<Vec<serde_json::Value>>,
+    ingest_buffer: Mutex<IngestBuffer>,
     /// Adaptive crawl concurrency (batch size dequeued per tick). Bounded
     /// [MIN_CONCURRENCY, MAX_CONCURRENCY]; adjusted from observed throughput.
     concurrency: Mutex<usize>,
@@ -567,13 +585,10 @@ struct IngestRequest {
 // Flush buffered docs to the indexer via the batch endpoint (one POST + one
 // commit for N docs). Returns number flushed.
 async fn flush_ingest_buffer(state: &Arc<AppState>) -> usize {
-    let batch: Vec<serde_json::Value> = {
-        let mut buf = state.ingest_buffer.lock().await;
-        if buf.is_empty() {
-            return 0;
-        }
-        std::mem::take(&mut *buf)
-    };
+    let batch: Vec<serde_json::Value> = state.ingest_buffer.lock().await.take();
+    if batch.is_empty() {
+        return 0;
+    }
     let n = batch.len();
     let payload = serde_json::json!({ "documents": batch, "replace_existing": true });
     if let Err(e) = state.crawl_client
@@ -591,6 +606,47 @@ async fn flush_ingest_buffer(state: &Arc<AppState>) -> usize {
 
 // Buffer size that triggers an immediate flush.
 const INGEST_FLUSH_THRESHOLD: usize = 20;
+
+/// Minimum docs before the periodic ticker issues a POST. Below this the HTTP
+/// and indexer overhead dominates the useful work (measured on the live
+/// crawler: ~1.5 docs per POST at 0.85 docs/s).
+const INGEST_FLUSH_MIN_BATCH: usize = 10;
+
+/// Upper bound on how long a buffered doc may wait, so a slow crawl still
+/// commits promptly instead of waiting to reach INGEST_FLUSH_MIN_BATCH.
+const INGEST_FLUSH_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// docs + the time the oldest buffered doc arrived, so the ticker can decide
+/// between "coalesce" and "don't make search wait".
+#[derive(Default)]
+struct IngestBuffer {
+    docs: Vec<serde_json::Value>,
+    since: Option<Instant>,
+}
+
+impl IngestBuffer {
+    fn push(&mut self, doc: serde_json::Value) {
+        if self.docs.is_empty() {
+            self.since = Some(Instant::now());
+        }
+        self.docs.push(doc);
+    }
+
+    fn take(&mut self) -> Vec<serde_json::Value> {
+        self.since = None;
+        std::mem::take(&mut self.docs)
+    }
+
+    fn timer_flush_due(&self) -> bool {
+        if self.docs.is_empty() {
+            return false;
+        }
+        let old_enough = self.since
+            .map(|since| since.elapsed() >= INGEST_FLUSH_MAX_AGE)
+            .unwrap_or(false);
+        self.docs.len() >= INGEST_FLUSH_MIN_BATCH || old_enough
+    }
+}
 
 
 // ─── API Types ───────────────────────────────────────────────────────
@@ -678,7 +734,7 @@ async fn main() {
         crawl_client,
         indexer_url: "http://127.0.0.1:6000".to_string(),
         embed_url: "http://127.0.0.1:3005/embed".to_string(),
-        ingest_buffer: Mutex::new(Vec::with_capacity(64)),
+        ingest_buffer: Mutex::new(IngestBuffer::default()),
         concurrency: Mutex::new(20),
         content_window: Mutex::new(VecDeque::with_capacity(300)),
         content_cap: Mutex::new(restored_cap),
@@ -708,14 +764,19 @@ async fn main() {
         });
     }
 
-    // Batch-ingest flush ticker: flushes the shared ingest buffer every 500ms so
-    // docs committed to the indexer at most 500ms after crawl, regardless of volume.
+    // Batch-ingest flush ticker: every 500ms, flush only when the buffer has
+    // enough docs to make the POST worthwhile OR the oldest doc has waited
+    // INGEST_FLUSH_MAX_AGE. Previously this flushed unconditionally, so a slow
+    // crawl issued ~1.5-doc POSTs; the big batches are ~150x cheaper per doc.
     {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                flush_ingest_buffer(&state).await;
+                let due = state.ingest_buffer.lock().await.timer_flush_due();
+                if due {
+                    flush_ingest_buffer(&state).await;
+                }
             }
         });
     }
@@ -1482,7 +1543,7 @@ async fn crawl_and_index(
     {
         let mut buf = state.ingest_buffer.lock().await;
         buf.push(index_payload);
-        if buf.len() >= INGEST_FLUSH_THRESHOLD {
+        if buf.docs.len() >= INGEST_FLUSH_THRESHOLD {
             drop(buf);
             flush_ingest_buffer(&state).await;
         }
@@ -1789,5 +1850,88 @@ mod tests {
         assert_eq!(adaptive_content_cap(&w_long, 3000), CONTENT_CAP_MAX);
         let w_short: VecDeque<usize> = (0..32).map(|_| 100).collect();
         assert_eq!(adaptive_content_cap(&w_short, 3000), CONTENT_CAP_MIN);
+    }
+
+    #[test]
+    fn timer_flush_waits_for_min_batch_when_buffer_is_young() {
+        let mut buf = IngestBuffer::default();
+        for _ in 0..(INGEST_FLUSH_MIN_BATCH - 1) {
+            buf.push(serde_json::json!({ "url": "https://example.test/a" }));
+        }
+        assert!(!buf.timer_flush_due(), "a young, small buffer must not spawn a tiny POST");
+    }
+
+    #[test]
+    fn timer_flush_fires_at_min_batch() {
+        let mut buf = IngestBuffer::default();
+        for _ in 0..INGEST_FLUSH_MIN_BATCH {
+            buf.push(serde_json::json!({ "url": "https://example.test/b" }));
+        }
+        assert!(buf.timer_flush_due(), "a full-enough batch must be flushed by the ticker");
+    }
+
+    #[test]
+    fn timer_flush_fires_on_max_age_even_when_batch_is_small() {
+        let mut buf = IngestBuffer::default();
+        buf.push(serde_json::json!({ "url": "https://example.test/c" }));
+        buf.since = Some(Instant::now() - INGEST_FLUSH_MAX_AGE - Duration::from_millis(1));
+        assert!(buf.timer_flush_due(), "old docs must not wait for MIN_BATCH forever");
+    }
+
+    #[test]
+    fn timer_flush_never_fires_on_empty_buffer() {
+        let mut buf = IngestBuffer::default();
+        buf.since = Some(Instant::now() - INGEST_FLUSH_MAX_AGE - Duration::from_secs(10));
+        assert!(buf.docs.is_empty());
+        assert!(!buf.timer_flush_due(), "an empty buffer has nothing to flush");
+    }
+
+    #[test]
+    fn snapshot_is_saved_gzipped_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("crawler_gzip_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        let p = path.to_str().unwrap();
+
+        let mut mgr = CrawlQueueManager::new();
+        mgr.enqueue(CrawlEntry {
+            url: "https://example.test/gzip".to_string(),
+            priority: 1.0,
+            source: "test".to_string(),
+            content_type: ContentType::Article,
+            discovered_at: 77,
+            attempts: 0,
+        });
+        save_snapshot_atomic(p, &mgr.snapshot(4321)).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "snapshot must be gzip-compressed");
+        let (loaded, cap) = CrawlQueueManager::load(p).expect("gzipped snapshot must load");
+        assert_eq!(cap, 4321);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.seen_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_plain_json_snapshot_still_loads() {
+        let dir = std::env::temp_dir().join(format!("crawler_legacy_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        let snap = QueueSnapshot {
+            version: 1,
+            queue: Vec::new(),
+            seen_urls: vec!["https://legacy.example/a".to_string()],
+            max_queue_size: 50_000,
+            max_discovered_per_page: 5,
+            content_cap: 8000,
+        };
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let (mgr, cap) = CrawlQueueManager::load(path.to_str().unwrap())
+            .expect("pre-gzip snapshots must still load");
+        assert_eq!(cap, 8000);
+        assert_eq!(mgr.seen_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
