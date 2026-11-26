@@ -6229,32 +6229,67 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     None
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FiletypeEvidence { Match, Mismatch, Unknown }
+
+/// Structural evidence for a `filetype:` constraint. Explicit mismatches are
+/// safe to drop; extensionless links are Unknown, never silently trusted.
+fn filetype_evidence(file_types: &[String], url: &str, _title: &str, _content: &str) -> FiletypeEvidence {
+    if file_types.is_empty() {
+        return FiletypeEvidence::Unknown;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return FiletypeEvidence::Mismatch;
+    };
+    let ext = std::path::Path::new(parsed.path())
+        .extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    if !ext.is_empty() {
+        return if file_types.iter().any(|ft| ft.to_lowercase() == ext) {
+            FiletypeEvidence::Match
+        } else {
+            FiletypeEvidence::Mismatch
+        };
+    }
+    // Signed CDN / viewer links often carry the real filename in a parameter.
+    let u = url.to_lowercase();
+    let hit = file_types.iter().any(|ft| {
+        let f = ft.to_lowercase();
+        ["file=", "filename=", "download=", "doc=", "path=", "url=", "response-content-disposition="]
+            .iter().any(|key| u.contains(&format!("{}{}", key, f)))
+            || u.contains(&format!(".{}", f))
+    });
+    if hit { FiletypeEvidence::Match } else { FiletypeEvidence::Unknown }
+}
+
+/// Keep only items carrying positive filetype evidence; if none match, fail
+/// open so a non-empty result set can never collapse to zero (same policy as
+/// inurl:/intext:).
+fn apply_filetype_policy<T: Clone>(
+    items: Vec<T>,
+    file_types: &[String],
+    evidence: impl Fn(&T) -> FiletypeEvidence,
+) -> (Vec<T>, bool) {
+    if file_types.is_empty() {
+        return (items, false);
+    }
+    let matches: Vec<T> = items.iter().filter(|i| evidence(i) == FiletypeEvidence::Match).cloned().collect();
+    if !matches.is_empty() {
+        (matches, false)
+    } else {
+        (items, true)
+    }
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
-    // 1. Hard filter on file_types
+    // 1. Hard filter on file_types. Explicit mismatches are dropped; extensionless
+    // links are Unknown and kept here — the post-merge policy only keeps them
+    // when at least one other result carries real matching evidence.
     if !constraints.file_types.is_empty() {
-        if let Ok(parsed_url) = reqwest::Url::parse(url) {
-            let path = parsed_url.path();
-            let ext = std::path::Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
-            if ext.is_empty() {
-                // The URL has no file extension at all (clean slug, CDN download
-                // link, Google Docs viewer, etc.). SearXNG already applied the
-                // `filetype:` constraint upstream, so we trust that and KEEP the
-                // result rather than hard-dropping it. Only when the URL *does*
-                // carry an extension do we require it to match — that's a
-                // reliable signal we can enforce without false negatives.
-                // (Previously every extensionless filetype result was dropped,
-                // which zeroed out `python filetype:pdf filetype:doc`.)
-            } else if !constraints.file_types.iter().any(|ft| ft.to_lowercase() == ext) {
-                return true;
-            }
-        } else {
-            return true;
+        match filetype_evidence(&constraints.file_types, url, title, content) {
+            FiletypeEvidence::Mismatch => return true,
+            FiletypeEvidence::Match | FiletypeEvidence::Unknown => {}
         }
     }
 
@@ -19232,6 +19267,26 @@ let mut results = match tokio::task::spawn_blocking(move || {
     results.retain(|r| {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
+    // FILETYPE: SearXNG does not honour filetype:, so enforce locally. Keep only
+    // results with positive type evidence; if none match, fail open to the
+    // pre-filter set and disclose it (a non-empty page must never become empty).
+    let requested_types = intent.structured_constraints.file_types.clone();
+    if !requested_types.is_empty() {
+        let (kept, fail_open) = apply_filetype_policy(results.clone(), &requested_types, |r| {
+            filetype_evidence(&requested_types, &r.url, &r.title, &r.content)
+        });
+        if fail_open {
+            tracing::warn!(
+                "FILETYPE FAIL-OPEN: no result carried evidence of {:?}; keeping the pre-filter set",
+                requested_types
+            );
+            results = pre_hard.clone();
+            let note = "filetype — operator parsed and reported, but no returned result carried matching type evidence, so no local narrowing was applied".to_string();
+            if !ignored.contains(&note) { ignored.push(note); }
+        } else {
+            results = kept;
+        }
+    }
     // FAIL-OPEN for inurl:/intext: — same never-collapse-to-zero policy as the
     // negative-constraint net below. These two operators are enforced only locally
     // (SearXNG ignores them), so a strict drop can empty the page when no candidate
@@ -21795,6 +21850,31 @@ mod constraint_fix_tests {
     fn literal_after_still_parsed() {
         let (after, _) = parse_date_constraints("rust after:2024");
         assert_eq!(after.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn filetype_evidence_distinguishes_match_mismatch_unknown() {
+        let ft = vec!["pdf".to_string()];
+        assert_eq!(filetype_evidence(&ft, "https://example.com/paper.pdf", "", ""), FiletypeEvidence::Match);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/paper.docx", "", ""), FiletypeEvidence::Mismatch);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/download?file=report.PDF", "", ""), FiletypeEvidence::Match);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/article", "", "See the PDF document"), FiletypeEvidence::Unknown);
+    }
+
+    #[test]
+    fn filetype_policy_keeps_matches_and_fails_open_when_none() {
+        let ft = vec!["pdf".to_string()];
+        let urls = vec![
+            "https://a.example/report.pdf".to_string(),
+            "https://b.example/index.html".to_string(),
+        ];
+        let (kept, fail_open) = apply_filetype_policy(urls.clone(), &ft, |u| filetype_evidence(&ft, u, "", ""));
+        assert_eq!(kept, vec!["https://a.example/report.pdf".to_string()]);
+        assert!(!fail_open);
+        let none_match = vec!["https://b.example/index.html".to_string()];
+        let (kept2, fail_open2) = apply_filetype_policy(none_match.clone(), &ft, |u| filetype_evidence(&ft, u, "", ""));
+        assert_eq!(kept2, none_match, "a non-empty set must never collapse to zero");
+        assert!(fail_open2);
     }
 
     #[test]
