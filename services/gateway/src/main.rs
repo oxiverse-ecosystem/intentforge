@@ -3015,6 +3015,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             if !val.is_empty() && !related.contains(&val) {
                 related.push(val);
             }
+        } else if let Some(val) = clean_p.strip_prefix("price_min:") {
+            if let Ok(v) = val.trim().trim_matches(',').parse::<f32>() { price_min = Some(v); }
+        } else if let Some(val) = clean_p.strip_prefix("price_max:") {
+            if let Ok(v) = val.trim().trim_matches(',').parse::<f32>() { price_max = Some(v); }
         } else if clean_p.starts_with("price:") {
             let val = clean_p.strip_prefix("price:").unwrap().trim().to_string();
             if let Some(p) = parse_price_range(&val) {
@@ -9521,7 +9525,8 @@ fn preprocess_searxng_query(query: &str) -> String {
     for w in q.split_whitespace() {
         let wl = w.to_lowercase();
         if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
-            || wl.starts_with("price:") || wl.starts_with("lang:")
+            || wl.starts_with("price:") || wl.starts_with("price_min:") || wl.starts_with("price_max:")
+            || wl.starts_with("lang:")
             || wl.starts_with("after:") || wl.starts_with("before:")
         {
             // Emit native operators (everything except price:, after:, before: which
@@ -15472,9 +15477,9 @@ async fn fetch_text_budgeted(
 /// part of the cache identity. `clean_query_for_spelling` deliberately drops
 /// them before spell correction; dropping them from the key too made
 /// `/search?q=foo` and `/search?q=site:example.org foo` share one cached body.
-const CACHE_IDENTITY_OPERATORS: [&str; 10] = [
+const CACHE_IDENTITY_OPERATORS: [&str; 12] = [
     "site:", "filetype:", "after:", "before:", "lang:", "intitle:",
-    "inurl:", "intext:", "related:", "price:",
+    "inurl:", "intext:", "related:", "price:", "price_min:", "price_max:",
 ];
 
 /// Stable, order-insensitive fingerprint of the structural operators in the
@@ -15533,6 +15538,7 @@ fn clean_query_for_spelling(q: &str) -> String {
         if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:")
             || wl.starts_with("lang:") || wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
             || wl.starts_with("related:") || wl.starts_with("price:")
+            || wl.starts_with("price_min:") || wl.starts_with("price_max:")
         {
             continue;
         }
@@ -15876,6 +15882,7 @@ async fn handle_search(
             if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:")
                 || wl.starts_with("before:") || wl.starts_with("intitle:") || wl.starts_with("inurl:")
                 || wl.starts_with("intext:") || wl.starts_with("lang:")
+                || wl.starts_with("price_min:") || wl.starts_with("price_max:")
             {
                 reconstructed.push(' ');
                 reconstructed.push_str(w);
@@ -18095,6 +18102,8 @@ async fn handle_search(
     // web result carries a parseable date. Otherwise keep recency as a scoring
     // boost only (fail-open) — a zero-width 'today' window combined with
     // fabricated URL-year dates would otherwise delete every result.
+    let reported_dates = snapshot_reported_date_bounds(&intent.structured_constraints);
+    let mut date_cleared_for_ranking = false;
     if dated_result_count == 0
         && (intent.structured_constraints.after_date.is_some()
             || intent.structured_constraints.before_date.is_some())
@@ -18104,6 +18113,7 @@ async fn handle_search(
         );
         intent.structured_constraints.after_date = None;
         intent.structured_constraints.before_date = None;
+        date_cleared_for_ranking = true;
     }
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
@@ -18168,6 +18178,7 @@ async fn handle_search(
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
+            date_cleared_for_ranking = true;
         }
     }
 
@@ -19454,6 +19465,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
             }
         }
     }
+    restore_reported_date_bounds(
+        &mut intent.structured_constraints,
+        &reported_dates,
+        date_cleared_for_ranking,
+        &mut ignored,
+    );
     let sc = &intent.structured_constraints;
     let mut applied: Vec<String> = Vec::new();
     // NOTE: `ignored` was declared up-front (near the constraint-normalization /
@@ -19880,6 +19897,40 @@ let mut results = match tokio::task::spawn_blocking(move || {
         response_json
     };
     (axum::http::StatusCode::OK, Json(final_json))
+}
+
+/// User-stated date bounds are captured before the date fail-open clears them
+/// for ranking, then restored into the reported constraints. Without this,
+/// `before:` disappeared from `structured_constraints` while `applied_constraints`
+/// still listed it (the same class of bug the price snapshot already fixes).
+#[derive(Clone, Debug)]
+struct ReportedDateBounds {
+    after: Option<String>,
+    before: Option<String>,
+}
+
+fn snapshot_reported_date_bounds(c: &Constraints) -> ReportedDateBounds {
+    ReportedDateBounds { after: c.after_date.clone(), before: c.before_date.clone() }
+}
+
+fn restore_reported_date_bounds(
+    c: &mut Constraints,
+    snap: &ReportedDateBounds,
+    cleared_for_ranking: bool,
+    ignored: &mut Vec<String>,
+) {
+    if snap.after.is_some() && c.after_date.is_none() {
+        c.after_date = snap.after.clone();
+    }
+    if snap.before.is_some() && c.before_date.is_none() {
+        c.before_date = snap.before.clone();
+    }
+    if cleared_for_ranking && (snap.after.is_some() || snap.before.is_some()) {
+        let note = "before:/after: — date bound parsed and reported, but no result carried a usable date, so the window was applied as a scoring boost only (no hard narrowing)".to_string();
+        if !ignored.contains(&note) {
+            ignored.push(note);
+        }
+    }
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -20562,6 +20613,20 @@ fn extract_gateway_constraints_uncached(q: &str) -> Constraints {
         }
     }
 
+    // Documented aliases price_min:/price_max: — previously left as literal
+    // positive terms, so no price constraint was extracted at all.
+    for (token, is_min) in [("price_min:", true), ("price_max:", false)] {
+        for cap in q_lower.match_indices(token) {
+            let after = cap.0 + token.len();
+            let rest = &q[after..];
+            let end = rest.find(' ').unwrap_or(rest.len());
+            let val = rest[..end].trim().trim_matches(',').to_lowercase();
+            if let Ok(v) = val.parse::<f32>() {
+                if is_min { price_min = Some(v); } else { price_max = Some(v); }
+            }
+        }
+    }
+
     // Extract lang:
     for cap in q_lower.match_indices("lang:") {
         let after = cap.0 + 5;
@@ -20661,7 +20726,7 @@ fn fallback_positive_terms(q: &str, negative: &[String]) -> Vec<String> {
     // `extract_gateway_constraints`). A token carrying one is an instruction,
     // not a topic — and its payload is already captured in the operator field.
     const OPERATORS: &[&str] = &[
-        "site:", "filetype:", "price:", "after:", "before:", "intitle:", "inurl:",
+        "site:", "filetype:", "price:", "price_min:", "price_max:", "after:", "before:", "intitle:", "inurl:",
         "intext:", "related:", "lang:", "not:",
     ];
 
@@ -21730,6 +21795,42 @@ mod constraint_fix_tests {
     fn literal_after_still_parsed() {
         let (after, _) = parse_date_constraints("rust after:2024");
         assert_eq!(after.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn price_min_max_aliases_are_extracted() {
+        let c = extract_gateway_constraints_uncached("laptop price_min:10 price_max:100");
+        assert_eq!(c.price_min, Some(10.0), "price_min: must set price_min");
+        assert_eq!(c.price_max, Some(100.0), "price_max: must set price_max");
+        assert_eq!(c.price_lt, None, "aliases must not masquerade as price:<");
+        assert_eq!(c.price_gt, None);
+    }
+
+    #[test]
+    fn date_fail_open_preserves_reported_before_bound() {
+        let mut c = cst();
+        c.before_date = Some("2025-01-01".to_string());
+        let snap = snapshot_reported_date_bounds(&c);
+        // Simulate the fail-open clearing used for ranking only.
+        c.after_date = None;
+        c.before_date = None;
+        let mut ignored: Vec<String> = Vec::new();
+        restore_reported_date_bounds(&mut c, &snap, true, &mut ignored);
+        assert_eq!(c.before_date.as_deref(), Some("2025-01-01"),
+            "user-stated before: must remain in the reported constraints");
+        assert!(ignored.iter().any(|n| n.contains("before")),
+            "fail-open must be disclosed in ignored_constraints");
+    }
+
+    #[test]
+    fn price_aliases_survive_sanitize_and_are_not_forwarded_upstream() {
+        let mut c = Constraints::default();
+        c.positive = vec!["price_min:10".to_string(), "shoes".to_string()];
+        let clean = sanitize_constraints(&c);
+        assert_eq!(clean.price_min, Some(10.0), "engine-emitted alias must be preserved");
+        let forwarded = preprocess_searxng_query("price_min:10 shoes");
+        assert!(forwarded.contains("shoes"), "topic term must survive");
+        assert!(!forwarded.contains("price_min:"), "operator must not leak upstream");
     }
 
     #[test]
