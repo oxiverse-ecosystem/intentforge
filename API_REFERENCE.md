@@ -945,10 +945,13 @@ curl "http://localhost:4000/search?q=python%20web%20framework%20NOT:flask"
 
 The `/search` endpoint supports cursor-free pagination via `limit` and `offset` parameters.
 
-> **Best-effort snapshot:** each offset is a fresh upstream fan-out, so `total`
-> and `has_more` are estimates for that request, not a stable cross-page
-> snapshot. Equal-score rows are tie-broken by URL to keep ordering stable, but
-> upstream result sets can still change between page requests.
+> **Best-effort without a token; stable with one:** each offset without a token
+> is a fresh upstream fan-out, so `total` and `has_more` are estimates for that
+> request. For stable, non-overlapping pages, take `snapshot_id` from the first
+> response and pass it back as the `snapshot_id` query parameter on subsequent
+> requests (with `limit`/`offset`). Snapshots are immutable for 120 seconds; a
+> missing/expired token transparently starts a new search. Equal-score rows are
+> tie-broken by URL.
 
 **Response fields:**
 

@@ -132,6 +132,10 @@ struct SearchParams {
     offset: Option<usize>,
     #[serde(default)]
     ip: Option<String>,
+    /// If supplied, page from a previously returned ranked snapshot instead of
+    /// re-running the upstream fan-out. Falls back to a fresh search on miss.
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 /// Validate the non-string query parameters before axum's extractor runs.
@@ -813,7 +817,7 @@ struct DeepResult {
     confidence: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct UnifiedResponse {
     query: String,
     intent: Option<String>,
@@ -896,6 +900,10 @@ struct UnifiedResponse {
     /// Decoration is strictly post-ranking — proven by the order-invariance test.
     #[serde(skip_serializing_if = "Option::is_none")]
     shopping: Option<serde_json::Value>,
+    /// Opaque token identifying the immutable ranked list this page came from.
+    /// Pass it back as `snapshot_id` for stable, non-overlapping pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -6211,6 +6219,24 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         }
     }
     None
+}
+
+/// Identity for a ranked-result snapshot. Includes geo and operator context so
+/// a token from one query/geo can never be reused for another.
+fn snapshot_id_for(query: &str, geo: &str, operators: &str, now_ms: u128) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (query, geo, operators).hash(&mut hasher);
+    format!("{:x}-{:x}", hasher.finish(), now_ms)
+}
+
+/// Slice an immutable ranked list. `total` and `has_more` always describe the
+/// whole snapshot, not the page, so consecutive pages cannot drift.
+fn paginate_snapshot<T: Clone>(items: &[T], offset: usize, limit: usize) -> (Vec<T>, usize, bool) {
+    let total = items.len();
+    let page = items.iter().skip(offset).take(limit).cloned().collect();
+    (page, total, offset + limit < total)
 }
 
 /// Score-descending sort with a URL tie-break: without it, equal-score rows
@@ -15676,6 +15702,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         price_verified: None,
         recall_gap_terms: None,
         shopping: None,
+        snapshot_id: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -15834,6 +15861,29 @@ async fn handle_search(
     // fingerprint from the ORIGINAL query. Typo variants still share an entry;
     // structural operators never do (they are parsed only after a cache hit).
     let cache_key = search_cache_key(&q_corrected_cleaned, &q_trimmed, &page_key, &geo_key);
+    // Snapshot page path: reuse an immutable ranked list, so total/has_more and
+    // page contents cannot drift between requests that hit different upstreams.
+    if let Some(id) = params.snapshot_id.as_deref() {
+        if let Some(json) = state.cache.get(&format!("snap:{}", id)) {
+            if let Ok(full) = serde_json::from_str::<Vec<MergedResult>>(&json) {
+                let snap_limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
+                let snap_offset = params.offset.unwrap_or(0);
+                let (page, total, more) = paginate_snapshot(&full, snap_offset, snap_limit);
+                let response = UnifiedResponse {
+                    query: q_trimmed.to_string(),
+                    results: page,
+                    total: Some(total),
+                    page_limit: Some(snap_limit),
+                    page_offset: Some(snap_offset),
+                    has_more: Some(more),
+                    snapshot_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+                return (axum::http::StatusCode::OK, Json(serde_json::to_value(response).unwrap_or_default()));
+            }
+        }
+        tracing::debug!("Snapshot {} missing or expired; running a fresh search", id);
+    }
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", q_corrected_cleaned);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
@@ -19493,6 +19543,20 @@ let mut results = match tokio::task::spawn_blocking(move || {
         } else {
             compute_recall_gap_terms(&q_trimmed, &results)
         };
+    // Immutable ranked-list snapshot: store the full post-filter set before
+    // slicing so subsequent pages come from the same list, not a new fan-out.
+    let snapshot_id = snapshot_id_for(
+        &q_trimmed,
+        &geo_key,
+        &search_cache_operator_key(&q_trimmed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    );
+    if let Ok(full_json) = serde_json::to_string(&results) {
+        state.cache.put(format!("snap:{}", snapshot_id), full_json, Duration::from_secs(120));
+    }
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // Backfill `published_date` from the same resolver the date filter uses
@@ -19938,6 +20002,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
         shopping: shopping_block,
+        snapshot_id: Some(snapshot_id),
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -27162,5 +27227,33 @@ mod search_cache_key_tests {
         assert_ne!(k, search_cache_key("rust", "rust site:example.org", "l10_o0", "none"));
         assert_ne!(k, search_cache_key("rust", "rust site:example.org", "all", "US"));
         assert_eq!(k, search_cache_key("RUST", "RUST SITE:example.org", "all", "none"));
+    }
+}
+
+#[cfg(test)]
+mod pagination_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_id_is_stable_and_input_sensitive() {
+        let a = snapshot_id_for("rust", "none", "site:example.org", 1234);
+        assert_eq!(a, snapshot_id_for("rust", "none", "site:example.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "none", "site:other.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "US", "site:example.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "none", "site:example.org", 5678));
+    }
+
+    #[test]
+    fn paginate_snapshot_pages_are_stable_and_disjoint() {
+        let items: Vec<String> = (0..25).map(|i| format!("u{}", i)).collect();
+        let (p0, total0, more0) = paginate_snapshot(&items, 0, 5);
+        let (p5, total5, more5) = paginate_snapshot(&items, 5, 5);
+        let (p20, total20, more20) = paginate_snapshot(&items, 20, 5);
+        assert_eq!(p0, items[0..5]);
+        assert_eq!(p5, items[5..10]);
+        assert_eq!(p20, items[20..25]);
+        assert_eq!((total0, total5, total20), (25, 25, 25));
+        assert!(more0 && more5 && !more20);
+        assert!(p0.iter().all(|u| !p5.contains(u)));
     }
 }
