@@ -722,6 +722,100 @@ struct VideoResult {
     score: f32
 }
 
+/// Maximum number of Invidious rows allowed to enter /videos. Prevents the
+/// self-hosted instance from flooding the page with YouTube results.
+const MAX_INVIDIOUS_VIDEO_RESULTS: usize = 5;
+
+/// Normalize YouTube URLs to a video ID so the same video returned by SearXNG
+/// and Invidious is only shown once.
+fn video_id_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if host == "youtu.be" {
+        let id = parsed.path().trim_start_matches('/').split('/').next().unwrap_or("");
+        return if id.is_empty() { None } else { Some(id.to_string()) };
+    }
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        for (k, v) in parsed.query_pairs() {
+            if k == "v" && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+        let parts: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
+        if matches!(parts.first(), Some(&"embed" | &"shorts" | &"v")) && parts.len() > 1 {
+            return Some(parts[1].to_string());
+        }
+    }
+    None
+}
+
+/// Convert an Invidious search row into a VideoResult with a relevance-derived
+/// score comparable to SearXNG's, instead of the old constant 0.5 that could
+/// never enter a page once SearXNG supplied `limit` results.
+fn invidious_video_result(r: &InvidiousResult, q: &str) -> Option<VideoResult> {
+    if r.result_type.as_deref() != Some("video") {
+        return None;
+    }
+    let vid = r.video_id.clone()?;
+    if vid.trim().is_empty() {
+        return None;
+    }
+    let title = r.title.clone().unwrap_or_default();
+    if title.trim().is_empty() {
+        return None;
+    }
+    let description = r.description.clone().unwrap_or_default();
+    let terms: Vec<&str> = q.split_whitespace().filter(|w| w.chars().count() > 2).collect();
+    let haystack = format!("{} {}", title.to_lowercase(), description.to_lowercase());
+    let hits = terms.iter().filter(|t| haystack.contains(&t.to_lowercase())).count();
+    let coverage = if terms.is_empty() { 0.0 } else { hits as f32 / terms.len() as f32 };
+    let score = (0.88 + 0.12 * coverage).min(1.0);
+    Some(VideoResult {
+        title,
+        url: format!("https://www.youtube.com/watch?v={}", vid),
+        description,
+        thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+        video_id: vid,
+        source: "invidious".to_string(),
+        score,
+    })
+}
+
+/// Merge the three providers: dedupe by URL and normalized video ID, admit at
+/// most MAX_INVIDIOUS_VIDEO_RESULTS Invidious rows, then order by score so a
+/// relevant Invidious video can actually appear in the truncated page.
+fn merge_video_results(
+    searx: Vec<VideoResult>,
+    searx2: Vec<VideoResult>,
+    invidious: Vec<VideoResult>,
+) -> Vec<VideoResult> {
+    let mut out: Vec<VideoResult> = Vec::new();
+    let mut seen_url = std::collections::HashSet::new();
+    let mut seen_id = std::collections::HashSet::new();
+    for r in searx.into_iter().chain(searx2) {
+        let id = if r.video_id.is_empty() { video_id_from_url(&r.url) } else { Some(r.video_id.clone()) };
+        if seen_url.contains(&r.url) || id.as_ref().map(|v| seen_id.contains(v)).unwrap_or(false) {
+            continue;
+        }
+        seen_url.insert(r.url.clone());
+        if let Some(v) = id { seen_id.insert(v); }
+        out.push(r);
+    }
+    let mut inv: Vec<VideoResult> = invidious.into_iter()
+        .filter(|r| !seen_url.contains(&r.url) && !seen_id.contains(&r.video_id))
+        .take(MAX_INVIDIOUS_VIDEO_RESULTS)
+        .collect();
+    sort_results_by(&mut inv, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
+    for r in inv {
+        if seen_url.contains(&r.url) || seen_id.contains(&r.video_id) { continue; }
+        seen_url.insert(r.url.clone());
+        seen_id.insert(r.video_id.clone());
+        out.push(r);
+    }
+    sort_results_by(&mut out, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
+    out
+}
+
 #[derive(Serialize)]
 struct NewsResult {
     title: String,
@@ -14009,21 +14103,7 @@ async fn handle_videos(
         match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&invidious_url).send()).await {
             Ok(Ok(resp)) => match read_json_bounded::<Vec<InvidiousResult>>(resp).await {
                 Some(data) => data.into_iter()
-                    .filter(|r| r.result_type.as_deref() == Some("video"))
-                    .filter_map(|r| {
-                        let vid = r.video_id?;
-                        let title = r.title.unwrap_or_default();
-                        let description = r.description.unwrap_or_default();
-                        Some(VideoResult {
-                            title,
-                            url: format!("https://www.youtube.com/watch?v={}", vid),
-                            description,
-                            thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
-                            video_id: vid,
-                            source: "invidious".to_string(),
-                            score: 0.5,
-                        })
-                    })
+                    .filter_map(|r| invidious_video_result(&r, &q))
                     .collect::<Vec<_>>(),
                 None => { tracing::warn!("Invidious parse error / exceeded cap"); vec![] }
             },
@@ -14044,21 +14124,9 @@ async fn handle_videos(
     };
     let (searx_results, searx2_results, invidious_results) = tokio::join!(searx_fut, searx2_fut, invidious_deadline);
 
-    // Merge results: SearXNG first, then SearXNG2, then Invidious
-    let mut results = searx_results;
-    {
-        let mut seen: std::collections::HashSet<String> = results.iter().map(|r| r.url.clone()).collect();
-        for r in searx2_results {
-            if seen.insert(r.url.clone()) {
-                results.push(r);
-            }
-        }
-        for r in invidious_results {
-            if seen.insert(r.url.clone()) {
-                results.push(r);
-            }
-        }
-    }
+    // Merge providers: dedupe by URL/videoId, admit bounded Invidious rows,
+    // and order by score so the page is not simply "SearXNG first, rest unseen".
+    let results = merge_video_results(searx_results, searx2_results, invidious_results);
 
     let mut response = serde_json::json!({
         "results": results,
@@ -27255,5 +27323,62 @@ mod pagination_snapshot_tests {
         assert_eq!((total0, total5, total20), (25, 25, 25));
         assert!(more0 && more5 && !more20);
         assert!(p0.iter().all(|u| !p5.contains(u)));
+    }
+}
+
+#[cfg(test)]
+mod video_ranking_tests {
+    use super::*;
+
+    #[test]
+    fn video_id_from_url_handles_youtube_and_youtu_be() {
+        assert_eq!(video_id_from_url("https://www.youtube.com/watch?v=abc123"), Some("abc123".to_string()));
+        assert_eq!(video_id_from_url("https://youtu.be/xyz789?t=30"), Some("xyz789".to_string()));
+        assert_eq!(video_id_from_url("https://www.youtube.com/embed/emb456"), Some("emb456".to_string()));
+        assert_eq!(video_id_from_url("https://example.com/article"), None);
+    }
+
+    #[test]
+    fn invidious_result_score_scales_with_title_relevance() {
+        let good = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Rust programming tutorial for beginners".into()),
+            video_id: Some("a".into()),
+            description: Some("Learn Rust programming".into()),
+        };
+        let poor = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Cooking pasta at home".into()),
+            video_id: Some("b".into()),
+            description: None,
+        };
+        let a = invidious_video_result(&good, "rust programming").unwrap();
+        let b = invidious_video_result(&poor, "rust programming").unwrap();
+        assert!(a.score > b.score, "relevant title must score higher");
+        assert!((0.88..=1.0).contains(&a.score), "score must be in the SearXNG band");
+    }
+
+    #[test]
+    fn invidious_result_requires_video_type_and_id() {
+        let no_id = InvidiousResult { result_type: Some("video".into()), title: Some("x".into()), video_id: None, description: None };
+        let channel = InvidiousResult { result_type: Some("channel".into()), title: Some("x".into()), video_id: Some("id".into()), description: None };
+        assert!(invidious_video_result(&no_id, "x").is_none());
+        assert!(invidious_video_result(&channel, "x").is_none());
+    }
+
+    #[test]
+    fn merge_video_results_dedupes_and_mixes_sources() {
+        let web = vec![
+            VideoResult { title: "Rust A".into(), url: "https://www.youtube.com/watch?v=same".into(), description: String::new(), video_id: String::new(), thumbnail: String::new(), source: "bing videos".into(), score: 0.9 },
+            VideoResult { title: "Rust B".into(), url: "https://vimeo.com/2".into(), description: String::new(), video_id: String::new(), thumbnail: String::new(), source: "duckduckgo videos".into(), score: 0.9 },
+        ];
+        let inv = vec![
+            VideoResult { title: "Rust C".into(), url: "https://www.youtube.com/watch?v=same".into(), description: String::new(), video_id: "same".into(), thumbnail: String::new(), source: "invidious".into(), score: 0.95 },
+            VideoResult { title: "Rust D".into(), url: "https://www.youtube.com/watch?v=new".into(), description: String::new(), video_id: "new".into(), thumbnail: String::new(), source: "invidious".into(), score: 0.93 },
+        ];
+        let merged = merge_video_results(web, vec![], inv);
+        assert_eq!(merged.len(), 3, "duplicate videoId must be dropped");
+        assert!(merged.iter().any(|r| r.source == "invidious"), "Invidious must be able to enter the page");
+        assert!(merged[0].score >= merged[1].score && merged[1].score >= merged[2].score);
     }
 }
