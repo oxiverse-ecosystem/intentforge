@@ -4,7 +4,7 @@
 > **Base URL (Development):** `http://localhost:4000`
 > **Protocol:** HTTPS (production) / HTTP (development)
 > **Format:** JSON
-> **Authentication:** None (public API)
+> **Authentication:** Public for search endpoints; `x-api-key` or Bearer JWT required for `/goals` (except `/goals/leaderboard`), `/shopping`, `/commerce/extract`. `X-Anonymous-Owner: <uuid-v4>` is accepted on `/goals` only.
 
 ---
 
@@ -945,6 +945,11 @@ curl "http://localhost:4000/search?q=python%20web%20framework%20NOT:flask"
 
 The `/search` endpoint supports cursor-free pagination via `limit` and `offset` parameters.
 
+> **Best-effort snapshot:** each offset is a fresh upstream fan-out, so `total`
+> and `has_more` are estimates for that request, not a stable cross-page
+> snapshot. Equal-score rows are tie-broken by URL to keep ordering stable, but
+> upstream result sets can still change between page requests.
+
 **Response fields:**
 
 | Field | Type | Description |
@@ -1270,7 +1275,12 @@ The cache is reset on the first request after expiry, not on a fixed interval. T
 
 ## Error Handling
 
-> **Verified (this session, 2026-08-05):** All error responses return **HTTP 400** with a JSON body. There are two distinct error codes, both observed live:
+> **Status classes (verified):** `400` validation (`empty_query`, `invalid_query`,
+> `invalid_parameter`), `401` unauthenticated, `404` unknown route or goal,
+> `405` wrong method, `422` malformed payload (`invalid_payload`), `500`
+> internal error. Every error body is JSON with at least `error` and `message`;
+> search validation errors additionally carry the full `UnifiedResponse`
+> envelope. Two distinct 400 codes were observed live:
 
 | Status | `error` code | `message` | When (verified) |
 |--------|-------------|-----------|-----------------|
@@ -1280,7 +1290,7 @@ The cache is reset on the first request after expiry, not on a fixed interval. T
 | `400` | `invalid_query` | `Query appears to be gibberish; no results returned` | Query flagged `junk` by the quality classifier (verified: `zxqw lkjasd qwe`, and non-Latin script `为什么天空是蓝色的`). Body includes `"query_quality":"junk"`. |
 | `400` | `invalid_parameter` | `Invalid value for 'limit': expected a non-negative integer, got 'abc'` | A numeric parameter (`limit`, `offset`, `count`, `n`) is not a valid `usize` -- e.g. `?limit=abc`, `?limit=-5`, `?limit=`, `?offset=1.5`. The message names the offending parameter. Same `UnifiedResponse` envelope as the other codes. |
 
-Error bodies always include the full `UnifiedResponse` envelope (with `null` for `intent`/`category`/`confidence`/`distribution`, empty `results: []`, and an empty `structured_constraints` object), plus `error`, `message`, and (for gibberish) `query_quality`. See `docs/_generated/api-transcript.md` blocks 18–25 for the exact raw bodies.
+Search validation error bodies always include the full `UnifiedResponse` envelope (with `null` for `intent`/`category`/`confidence`/`distribution`, empty `results: []`, and an empty `structured_constraints` object), plus `error`, `message`, and (for gibberish) `query_quality`. Authentication, framework 404/405 and Goals payload errors return the shared `{error, message}` shape instead. See `docs/_generated/api-transcript.md` blocks 18–25 for the exact raw bodies.
 
 **Notes on the documented-but-not-observed cases:**
 - The `200` + `{"error":"upstream_unavailable",...}` failure mode described below was **NOT triggered** in this session — all upstreams (SearXNG via VPN, SearXNG2 via Tor, local indexer) were healthy. Treat it as *aspirational/unverified* until reproduced. The API is designed never to return 5xx; internal errors are handled gracefully (partial results from whichever backends succeeded, or an empty `results` array with a diagnostic `message`).
@@ -1535,8 +1545,10 @@ All search backends are queried in parallel with configurable timeouts. Results 
 
 ## Goals API
 
-> **Authentication required.** All `/goals*` routes return
-> `401 {"error":"unauthorized"}` without a valid API key — see
+> **Authentication required on guarded routes.** All `/goals*` routes **except
+> `/goals/leaderboard`** return `401 {"error":"unauthorized"}` without a valid
+> credential. Accepted credentials are the API key (`x-api-key` or Bearer), a
+> Supabase Bearer JWT, or `X-Anonymous-Owner: <uuid-v4>`. See
 > [Getting Started > API key](#0-api-key-only-needed-for-goals-shopping-commerceextract).
 
 The Goals feature transforms a user's long-term goal (e.g. "build an AI assistant", "write a fantasy novel", "start a SaaS business") into a personalized, phased roadmap with curated resources, deadlines, and deliverables.
@@ -1588,6 +1600,8 @@ Quick Flow (one-shot):
 | `POST` | `/goals/:goal_id/phases/:phase_id/complete` | Mark a phase complete (1-indexed `phase_id`, sets `true` only) |
 | `GET`  | `/goals/:goal_id/progress` | Read-only progress state for a goal |
 | `POST` | `/goals/:goal_id/progress` | Update phase completion (`{"phase_id":1,"is_completed":true}`; can toggle `false`) |
+| `POST` | `/goals/claim` | Claim anonymous goals to an authenticated Supabase user (Bearer JWT + `X-Anonymous-Owner`) |
+| `PUT` | `/consents/:purpose` | Set a consent flag (`leaderboard` or `hiring_notices`); Bearer JWT required |
 
 Phase 1 (2026-11): `/goals/leaderboard` is public and returns `[]` until accounts launch; anonymous callers send `X-Anonymous-Owner: <uuid-v4>` and receive an additive `expires_at` field.
 

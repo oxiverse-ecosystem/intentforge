@@ -193,27 +193,11 @@ where
     }
 }
 
-/// Build the documented `400 invalid_parameter` body: the `UnifiedResponse`
-/// envelope with neutral fields, matching `empty_query` / `invalid_query`.
+/// Build the documented `400 invalid_parameter` body via the same envelope
+/// builder as every other validation error, so key sets never drift.
 fn parameter_error(message: &str) -> axum::response::Response {
-    (
-        axum::http::StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "query": "",
-            "intent": null,
-            "category": null,
-            "confidence": null,
-            "constraints": [],
-            "structured_constraints": serde_json::to_value(Constraints::default())
-                .unwrap_or(serde_json::json!({})),
-            "expanded_queries": [],
-            "distribution": null,
-            "results": [],
-            "error": "invalid_parameter",
-            "message": message,
-        })),
-    )
-        .into_response()
+    let (status, body) = make_error_response("", "invalid_parameter", message, false);
+    (status, body).into_response()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -6227,6 +6211,14 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
         }
     }
     None
+}
+
+/// Score-descending sort with a URL tie-break: without it, equal-score rows
+/// keep whichever order the raced upstream engines happened to return, so
+/// consecutive pages (each its own fan-out) contain overlapping URLs.
+fn sort_results_by<T, F>(items: &mut Vec<T>, mut cmp: F)
+where F: FnMut(&T, &T) -> std::cmp::Ordering {
+    items.sort_by(&mut cmp);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12881,7 +12873,7 @@ fn merge_local_and_web(
     }
 
     // 4. Sort by score descending
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
 
     // 4b. Position-aware domain diversity: penalize repeated domains in top slots.
     // The global cap (MAX_PER_DOMAIN=3) prevents outright flooding, but doesn't
@@ -12906,7 +12898,7 @@ fn merge_local_and_web(
             }
         }
         // Re-sort after diversity penalty
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // 4b-ii. OFF-TOPIC DOMAIN SATURATION GUARD (D-C: a single unrelated brand
@@ -12960,7 +12952,7 @@ fn merge_local_and_web(
                 }
             }
         }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // 4c. Source-level diversity boost: boost results from underrepresented engine sources.
@@ -13355,7 +13347,7 @@ fn merge_local_and_web(
 
     // Re-sort by score descending after post-calibration caps to ensure capped
     // results (video/dict/weak-match) move below higher-scoring text results.
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
 
     merged
 }
@@ -14483,7 +14475,10 @@ async fn main() {
                 .with_state(state.clone())
                 .route_layer(middleware::from_fn(auth_middleware)),
         )
-        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
+        .fallback(json_not_found)
+        .with_state(state)
+        .layer(middleware::from_fn(normalize_framework_errors))
+        .layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     // Bind port is env-configurable (default 4000) so a second, side-by-side
     // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
@@ -15618,6 +15613,37 @@ fn error_chain_is_dns(e: &(dyn std::error::Error + 'static)) -> bool {
         src = std::error::Error::source(s);
     }
     false
+}
+
+async fn json_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not_found", "message": "Unknown route" })),
+    )
+}
+
+/// axum 0.7 emits empty bodies for 404/405 when no fallback exists. Normalize
+/// those framework responses to the same JSON error shape as application errors.
+async fn normalize_framework_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let res = next.run(request).await;
+    let status = res.status();
+    if status != axum::http::StatusCode::NOT_FOUND && status != axum::http::StatusCode::METHOD_NOT_ALLOWED {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let bytes = axum::body::to_bytes(body, 8192).await.unwrap_or_default();
+    if !bytes.is_empty() {
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let (code, message) = if status == axum::http::StatusCode::NOT_FOUND {
+        ("not_found", "Unknown route")
+    } else {
+        ("method_not_allowed", "Method not allowed for this route")
+    };
+    (status, Json(serde_json::json!({ "error": code, "message": message }))).into_response()
 }
 
 fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
@@ -18400,7 +18426,7 @@ async fn handle_search(
                 r
             }).collect();
             // Sort by penalized score to push multi-violation results down
-            scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            sort_results_by(&mut scored_results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
             web_results = scored_results;
         }
     }
@@ -19259,7 +19285,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             }
         }
         // Re-sort by final score
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
     // Hard filter on all constraints (file types, sites, date bounds, phrases, and negatives) post-merge:
     let pre_hard = results.clone();
@@ -19327,7 +19353,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 r.score *= 0.25;
             }
         }
-        restored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut restored, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
         results = restored;
     }
 
@@ -19339,7 +19365,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         for r in results.iter_mut() {
             r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
         }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
@@ -27031,6 +27057,41 @@ mod negative_constraint_retention_tests {
             validate_numeric_params("q=rust&limit="),
             Some(("limit".to_string(), String::new()))
         );
+    }
+
+    #[test]
+    fn sort_by_score_then_url_is_deterministic_for_ties() {
+        #[derive(Clone)]
+        struct Row { url: String, score: f32 }
+        let mut a = vec![
+            Row { url: "https://z.example".into(), score: 0.9 },
+            Row { url: "https://a.example".into(), score: 0.9 },
+            Row { url: "https://m.example".into(), score: 0.8 },
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let cmp = |x: &Row, y: &Row| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| x.url.cmp(&y.url));
+        sort_results_by(&mut a, cmp);
+        sort_results_by(&mut b, cmp);
+        let urls: Vec<_> = a.iter().map(|r| r.url.as_str()).collect();
+        let urls_b: Vec<_> = b.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.example", "https://z.example", "https://m.example"]);
+        assert_eq!(urls, urls_b, "equal-score rows must not depend on upstream arrival order");
+    }
+
+    #[tokio::test]
+    async fn parameter_error_envelope_matches_empty_query_envelope() {
+        let p = parameter_error("Invalid value for 'limit': expected a non-negative integer, got 'abc'");
+        let (_, e) = make_error_response("", "empty_query", "Query parameter 'q' is empty", false);
+        let e = e.into_response();
+        let pb = axum::body::to_bytes(p.into_body(), 8192).await.unwrap();
+        let eb = axum::body::to_bytes(e.into_body(), 8192).await.unwrap();
+        let pv: serde_json::Value = serde_json::from_slice(&pb).unwrap();
+        let ev: serde_json::Value = serde_json::from_slice(&eb).unwrap();
+        let mut pk: Vec<String> = pv.as_object().unwrap().keys().cloned().collect();
+        let mut ek: Vec<String> = ev.as_object().unwrap().keys().cloned().collect();
+        pk.sort(); ek.sort();
+        assert_eq!(pk, ek, "all 400 paths must share one envelope");
     }
 
     #[tokio::test]
