@@ -15468,6 +15468,57 @@ async fn fetch_text_budgeted(
     }
 }
 
+/// Operator tokens that change the meaning of a search and therefore must be
+/// part of the cache identity. `clean_query_for_spelling` deliberately drops
+/// them before spell correction; dropping them from the key too made
+/// `/search?q=foo` and `/search?q=site:example.org foo` share one cached body.
+const CACHE_IDENTITY_OPERATORS: [&str; 10] = [
+    "site:", "filetype:", "after:", "before:", "lang:", "intitle:",
+    "inurl:", "intext:", "related:", "price:",
+];
+
+/// Stable, order-insensitive fingerprint of the structural operators in the
+/// ORIGINAL query. Pure so it can be unit-tested without a running gateway.
+fn search_cache_operator_key(raw_query: &str) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut in_quote = false;
+    let mut phrase = String::new();
+    let mut unquoted = String::new();
+    for ch in raw_query.chars() {
+        if matches!(ch, '"' | '“' | '”' | '‘' | '’') {
+            if in_quote {
+                tokens.push(format!("q:{}", phrase.trim().to_lowercase()));
+                phrase.clear();
+            }
+            in_quote = !in_quote;
+        } else if in_quote {
+            phrase.push(ch);
+        } else {
+            unquoted.push(ch);
+        }
+    }
+    for word in unquoted.split_whitespace() {
+        let w = word.trim_matches(',').to_lowercase();
+        if w.starts_with('-') || CACHE_IDENTITY_OPERATORS.iter().any(|op| w.starts_with(op)) {
+            tokens.push(w);
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    if tokens.is_empty() { "-".to_string() } else { tokens.join("|") }
+}
+
+/// Full /search cache identity: typo-normalized text + operator fingerprint +
+/// pagination + geo. The `search:` namespace prevents aliasing with the media
+/// endpoints' cache keys (e.g. `images:{q}:{geo}`).
+fn search_cache_key(corrected_clean: &str, raw_query: &str, page_key: &str, geo_key: &str) -> String {
+    format!("search:{}:{}:{}:{}",
+        corrected_clean.to_lowercase(),
+        search_cache_operator_key(raw_query),
+        page_key,
+        geo_key)
+}
+
 fn clean_query_for_spelling(q: &str) -> String {
     let normalized = q
         .replace('“', "")
@@ -15712,16 +15763,10 @@ async fn handle_search(
         tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
     }
 
-    // 0b.6: Cache lookup, keyed on the CORRECTED query. Done after correction so
-    // typo variants share one entry (and one upstream fan-out).
-    // `q_corrected_cleaned` is what the engine actually searches, so it is the
-    // right identity for the cached body.
-    let cache_key = format!(
-        "{}:{}:{}",
-        q_corrected_cleaned.to_lowercase(),
-        page_key,
-        geo_key
-    );
+    // 0b.6: Cache lookup, keyed on the CORRECTED query plus an operator
+    // fingerprint from the ORIGINAL query. Typo variants still share an entry;
+    // structural operators never do (they are parsed only after a cache hit).
+    let cache_key = search_cache_key(&q_corrected_cleaned, &q_trimmed, &page_key, &geo_key);
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", q_corrected_cleaned);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
@@ -26835,5 +26880,45 @@ mod negative_constraint_retention_tests {
             "title-dominated result should get score 0.0, got {}",
             score
         );
+    }
+}
+
+#[cfg(test)]
+mod search_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn search_cache_key_distinguishes_operator_variants() {
+        let base = "quokkajtqpaonp";
+        let plain = search_cache_key(base, base, "all", "none");
+        let after = search_cache_key(base, &format!("after:2024-01-01 {}", base), "all", "none");
+        let site = search_cache_key(base, &format!("site:example.org {}", base), "all", "none");
+        assert_ne!(plain, after, "after: must be part of cache identity");
+        assert_ne!(plain, site, "site: must be part of cache identity");
+        assert_ne!(after, site, "different operators must not share a cache entry");
+    }
+
+    #[test]
+    fn search_cache_key_is_order_case_insensitive_and_shares_typos() {
+        let a = search_cache_key(
+            "biryani recipe",
+            "biryani recipie site:example.org after:2024-01-01",
+            "all", "none");
+        let b = search_cache_key(
+            "biryani recipe",
+            "biryani recipe AFTER:2024-01-01 SITE:example.org",
+            "all", "none");
+        assert_eq!(a, b, "operator order and case must not fragment the cache");
+        assert_ne!(a, search_cache_key("biryani recipe", "biryani recipe", "all", "none"),
+            "bare query must not share an operator query's entry");
+    }
+
+    #[test]
+    fn search_cache_key_partitions_page_geo_and_namespace() {
+        let k = search_cache_key("rust", "rust site:example.org", "all", "none");
+        assert!(k.starts_with("search:"), "key must be namespaced away from media endpoints");
+        assert_ne!(k, search_cache_key("rust", "rust site:example.org", "l10_o0", "none"));
+        assert_ne!(k, search_cache_key("rust", "rust site:example.org", "all", "US"));
+        assert_eq!(k, search_cache_key("RUST", "RUST SITE:example.org", "all", "none"));
     }
 }
