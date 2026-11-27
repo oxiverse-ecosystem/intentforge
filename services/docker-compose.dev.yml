@@ -412,6 +412,24 @@ services:
       retries: 5
     restart: always
 
+  # Opt-in public access: docker compose -f docker-compose.dev.yml --profile tunnel up -d cloudflared
+  # Requires TUNNEL_TOKEN in ../.env; see docs/CLOUDFLARE_TUNNEL.md.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: if-dev-cloudflared
+    profiles:
+      - tunnel
+    # Shares gluetun's netns, so the dashboard Service URL is http://localhost:4000
+    # (service-name DNS does not resolve inside a shared network namespace).
+    network_mode: "service:gluetun"
+    env_file:
+      - ../.env
+    command: tunnel --no-autoupdate --loglevel info run
+    depends_on:
+      gluetun:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   invidious-db-data-dev:
   geolite2-data:
