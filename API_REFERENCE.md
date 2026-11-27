@@ -315,14 +315,14 @@ Image search via SearXNG (`categories=images`). Returns a flat list with image +
 
 ### `GET /videos`
 
-Video search via SearXNG (`categories=videos`). Returns a flat list with `thumbnail` (not `thumbnail_url`) and `video_id`.
+Video search via SearXNG (`categories=videos`) plus the configured Invidious instance. Returns a flat list with `thumbnail` (not `thumbnail_url`) and `video_id`.
 
 **Query Parameters**
 
 | Parameter | Type   | Required | Default | Description                |
 |-----------|--------|----------|---------|----------------------------|
 | `q`       | string | yes      | —       | Search query (URL-encoded) |
-| `limit`   | int    | no       | all     | Max results to return      |
+| `limit`   | int    | no       | 20      | Max results to return      |
 
 **Response** `200 OK` — top-level `{ count, query, results[] }`. Each result (verified live, 2026-08-05):
 

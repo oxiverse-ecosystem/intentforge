@@ -13773,6 +13773,14 @@ struct AppState {
 /// Apply the optional `limit` to a `{results, count, query}` media response.
 /// The cache stores the full result set, so truncation happens on read and a
 /// cached response can still serve a different page size.
+/// Default page size for `/videos` — 20 gives a useful result set while the
+/// explicit `limit` parameter still wins. Other media endpoints keep "all".
+const VIDEOS_DEFAULT_LIMIT: usize = 20;
+
+fn effective_media_limit(explicit: Option<usize>, default: usize) -> Option<usize> {
+    Some(explicit.unwrap_or(default))
+}
+
 fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
     let Some(limit) = limit else { return value };
     if let Some(arr) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -14139,7 +14147,7 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, effective_media_limit(params.limit, VIDEOS_DEFAULT_LIMIT))))
 }
 
 async fn handle_news(
@@ -27380,5 +27388,15 @@ mod video_ranking_tests {
         assert_eq!(merged.len(), 3, "duplicate videoId must be dropped");
         assert!(merged.iter().any(|r| r.source == "invidious"), "Invidious must be able to enter the page");
         assert!(merged[0].score >= merged[1].score && merged[1].score >= merged[2].score);
+    }
+
+    #[test]
+    fn videos_default_to_twenty_results_but_honor_explicit_limit() {
+        assert_eq!(effective_media_limit(None, VIDEOS_DEFAULT_LIMIT), Some(20));
+        assert_eq!(effective_media_limit(Some(5), VIDEOS_DEFAULT_LIMIT), Some(5));
+        let mut value = serde_json::json!({"count": 30, "results": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30]});
+        value = apply_media_limit(value, effective_media_limit(None, VIDEOS_DEFAULT_LIMIT));
+        assert_eq!(value["count"], 20);
+        assert_eq!(value["results"].as_array().unwrap().len(), 20);
     }
 }
