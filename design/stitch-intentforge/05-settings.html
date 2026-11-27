@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_dashboard" name="shell-type"/><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config={darkMode:"class",theme:{extend:{colors:{"surface-container":"#1c2028","error":"#ffb4ab","on-error":"#690005","on-primary":"#00382a","surface-tint":"#00e0af","surface-container-low":"#181c24","secondary-fixed-dim":"#7bd0ff","error-container":"#93000a","surface-container-high":"#262a33","outline-variant":"#3b4a43","primary-fixed-dim":"#00e0af","surface-variant":"#31353e","on-tertiary":"#472a00","surface":"#0f131c","on-primary-container":"#00614a","on-tertiary-fixed":"#2a1700","on-primary-fixed-variant":"#00513d","tertiary-container":"#ffbe6d","on-secondary-container":"#00374d","on-secondary":"#00354a","inverse-surface":"#dfe2ee","on-tertiary-container":"#784b00","on-surface":"#dfe2ee","background":"#0f131c","on-primary-fixed":"#002117","tertiary-fixed":"#ffddb8","tertiary-fixed-dim":"#ffb95f","on-secondary-fixed":"#001e2c","inverse-primary":"#006c53","surface-container-lowest":"#0a0e16","secondary-container":"#00a6e0","on-surface-variant":"#bacac2","primary-container":"#00e5b3","outline":"#84948c","tertiary":"#ffe2c3","surface-dim":"#0f131c","on-tertiary-fixed-variant":"#653e00","on-error-container":"#ffdad6","surface-container-highest":"#31353e","on-secondary-fixed-variant":"#004c69","secondary-fixed":"#c4e7ff","inverse-on-surface":"#2c3039","primary-fixed":"#42feca","secondary":"#7bd0ff","primary":"#6fffd1","surface-bright":"#353942","on-background":"#dfe2ee"},borderRadius:{"DEFAULT":"0.125rem","lg":"0.25rem","xl":"0.5rem","full":"0.75rem"},spacing:{"margin":"1rem","gutter":"0.75rem","space-2xl":"2rem","space-xs":"0.25rem","space-xl":"1.5rem","space-md":"0.75rem","space-sm":"0.5rem","space-2xs":"0.125rem","margin-md":"1.5rem","gutter-md":"1rem","space-lg":"1rem"},fontFamily:{"label-md":["JetBrains Mono"],"display-lg":["Inter"],"code-md":["JetBrains Mono"],"body-lg":["Inter"],"kbd":["JetBrains Mono"],"headline-lg-mobile":["Inter"],"headline-sm":["Inter"],"code-sm":["JetBrains Mono"],"code-lg":["JetBrains Mono"],"label-sm":["JetBrains Mono"],"headline-lg":["Inter"],"body-md":["Inter"],"body-sm":["Inter"],"headline-md":["Inter"]},fontSize:{"label-md":["11px",{"lineHeight":"14px","letterSpacing":"0.06em","fontWeight":"600"}],"display-lg":["30px",{"lineHeight":"38px","letterSpacing":"-0.025em","fontWeight":"600"}],"code-md":["12px",{"lineHeight":"18px","letterSpacing":"-0.01em","fontWeight":"400"}],"body-lg":["14px",{"lineHeight":"22px","letterSpacing":"0em","fontWeight":"400"}],"kbd":["10px",{"lineHeight":"10px","letterSpacing":"0.02em","fontWeight":"600"}],"headline-lg-mobile":["18px",{"lineHeight":"24px","letterSpacing":"-0.015em","fontWeight":"600"}],"headline-sm":["14px",{"lineHeight":"20px","letterSpacing":"-0.005em","fontWeight":"600"}],"code-sm":["11px",{"lineHeight":"15px","letterSpacing":"0em","fontWeight":"400"}],"code-lg":["13px",{"lineHeight":"20px","letterSpacing":"-0.01em","fontWeight":"500"}],"label-sm":["10px",{"lineHeight":"12px","letterSpacing":"0.08em","fontWeight":"500"}],"headline-lg":["22px",{"lineHeight":"28px","letterSpacing":"-0.02em","fontWeight":"600"}],"body-md":["13px",{"lineHeight":"19px","letterSpacing":"0em","fontWeight":"400"}],"body-sm":["12px",{"lineHeight":"16px","letterSpacing":"0.01em","fontWeight":"400"}],"headline-md":["16px",{"lineHeight":"22px","letterSpacing":"-0.01em","fontWeight":"600"}]}}}};</script></head><body class="bg-background font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 inset-x-0 z-50 bg-surface-container-lowest"><div class="h-14 w-full px-gutter-md flex items-center justify-between gap-space-md"><div class="flex items-center gap-space-md min-w-0"><div class="flex items-center gap-space-sm shrink-0"><span class="w-2 h-2 rounded-full bg-primary-container animate-pulse"></span><span class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight">IntentForge <span class="text-primary font-code-md text-code-md font-medium">v2</span></span></div><div class="hidden xl:flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">SELF-HOSTED // node-01-sgx // 14ms latency</span></div></div><div class="flex-1 max-w-xl mx-space-md hidden md:block"><div class="w-full flex items-center justify-between px-space-md py-space-xs bg-surface-container-low rounded"><div class="flex items-center gap-space-sm min-w-0"><span class="font-code-md text-code-md text-primary font-medium shrink-0">&gt;_</span><span class="font-code-md text-code-md text-on-surface-variant truncate">scope:hybrid intent:crawl --live</span></div><div class="flex items-center gap-space-xs shrink-0"><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">/</kbd><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">⌘K</kbd></div></div></div><div class="flex items-center gap-space-md shrink-0"><div class="hidden lg:flex items-center gap-space-sm"><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Vector Sync: <span class="text-on-surface font-code-sm text-code-sm">4.2M docs</span></span></div><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-secondary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Tunnel: <span class="text-secondary font-code-sm text-code-sm">ACTIVE</span></span></div></div><div class="flex items-center gap-space-sm"><button class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs" type="button"><span class="material-symbols-outlined text-sm text-primary">terminal</span><span class="hidden sm:inline">DEV</span></button><img alt="Profile" class="w-8 h-8 rounded-full object-cover" src="https://lh3.googleusercontent.com/aida/ALJJyrAfkFzl8qQWjIuA1o8YDioW6crvCUXIcVbnhpB8o23rl9Mr6L0r5TVsg7hwd-OHqLU_dsGv_jMHnClm46hgEeS5gD_ed39I7lOB56J6zDz-nJ8mu1Ox7MNTBM6HnmOVINJFLWOC7f8dhDcNUAaZQrmRba13qMfei8CsBh78jnQ1L4bdaGOT9PmCwrnwMFRb4Hc9BU2cbqZXm_BASYNkrJSfS2HSBVz__oke29nXGKGu"/></div></div></div><div class="w-full px-gutter-md bg-surface-container-low"><div class="flex items-center justify-between overflow-x-auto"><nav class="flex items-center gap-space-xs py-space-2xs" data-active-classes="text-primary font-semibold bg-surface-container"><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="search-and-inspect" href="#">Search &amp; Inspect</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="media-and-verticals" href="#">Media &amp; Verticals</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="goals-engine" href="#">Goals Engine</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="developer-api" href="#">Developer API</a><a aria-current="page" class="px-space-md py-space-xs rounded uppercase tracking-wider transition-colors whitespace-nowrap text-primary font-semibold bg-surface-container" data-path="node-settings" href="#">Node Settings</a></nav><div class="hidden sm:flex items-center gap-space-sm py-space-2xs text-on-surface-variant"><span class="font-code-sm text-code-sm">SYS_OK</span><span class="font-code-sm text-code-sm text-outline-variant">|</span><span class="font-code-sm text-code-sm">ENC:AES-256</span></div></div></div></header><aside class="fixed left-0 top-24 bottom-0 w-64 bg-surface-container-lowest z-40 hidden md:flex flex-col justify-between p-space-md"><div class="space-y-space-lg"><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Discovery Rail</div><div class="space-y-space-2xs"><div class="px-space-sm py-space-xs bg-surface-container-low rounded text-on-surface font-body-sm text-body-sm flex items-center justify-between"><span class="font-code-sm text-code-sm text-primary">#hybrid-rerank</span><span class="font-label-sm text-label-sm text-on-surface-variant">v0.98</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#vector-dense</span><span class="font-label-sm text-label-sm text-on-surface-variant">qdrant</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#bm25-sparse</span><span class="font-label-sm text-label-sm text-on-surface-variant">local</span></div></div></div><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Autonomous Tasks</div><div class="space-y-space-2xs"><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Arxiv Vector Indexer</span><span class="font-label-sm text-label-sm text-primary">84%</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-primary-container w-[84%]"></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Security CVE Crawl</span><span class="font-label-sm text-label-sm text-secondary">RUNNING</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-secondary-container w-[42%]"></div></div></div></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>RAM UTILIZATION</span><span class="font-code-sm text-code-sm text-on-surface">6.2 / 32 GB</span></div><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>INDEX CACHE HIT</span><span class="font-code-sm text-code-sm text-primary">99.4%</span></div></div></aside><div class="md:pl-64"><main class="relative pt-24 min-h-screen bg-background w-full px-gutter-md py-space-lg"><div class="flex flex-col w-full">
+<!-- System Diagnostic Header Strip -->
+<section class="relative bg-surface-container-lowest p-space-md rounded-lg shadow-sm mb-space-md">
+<div class="flex flex-col lg:flex-row lg:items-center justify-between gap-space-md">
+<!-- Node Identity & Quick Health -->
+<div class="flex items-center gap-space-md min-w-0">
+<div class="w-10 h-10 rounded bg-surface-container-high flex items-center justify-center shrink-0 text-primary">
+<span class="material-symbols-outlined text-lg">dns</span>
+</div>
+<div class="min-w-0">
+<div class="flex items-center gap-space-xs flex-wrap">
+<span class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight">intentforge-selfhost-fra-01</span>
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-primary font-label-sm text-label-sm uppercase rounded">Node Healthy</span>
+<span class="px-space-xs py-space-2xs bg-surface-container-low text-secondary font-code-sm text-code-sm rounded">sgx-enclave-ok</span>
+</div>
+<div class="flex items-center gap-space-sm mt-space-2xs text-on-surface-variant font-code-sm text-code-sm">
+<span>Uptime: <span class="text-on-surface">42d 18h 12m</span></span>
+<span>•</span>
+<span>OS: <span class="text-on-surface">Debian 12 (Linux 6.6.13-hardened)</span></span>
+</div>
+</div>
+</div>
+<!-- Quick Metrics Gauges -->
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-space-xs shrink-0 font-code-sm text-code-sm">
+<div class="p-space-xs px-space-sm bg-surface-container-low rounded">
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">MEM USAGE</div>
+<div class="text-on-surface font-semibold">3.8 / 16.0 GB <span class="text-primary font-normal">(23%)</span></div>
+</div>
+<div class="p-space-xs px-space-sm bg-surface-container-low rounded">
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">NVMe DISK</div>
+<div class="text-on-surface font-semibold">142 GB <span class="text-on-surface-variant font-normal">(410 GB free)</span></div>
+</div>
+<div class="p-space-xs px-space-sm bg-surface-container-low rounded">
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">INDEX LATENCY</div>
+<div class="text-primary font-semibold">1.42ms <span class="text-on-surface-variant font-normal">p99</span></div>
+</div>
+<div class="p-space-xs px-space-sm bg-surface-container-low rounded">
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">ACTIVE TUNNEL</div>
+<div class="text-secondary font-semibold">cf-tunnel-01</div>
+</div>
+</div>
+</div>
+</section>
+<!-- Main System Configuration Multi-Card Grid -->
+<div class="grid grid-cols-1 xl:grid-cols-12 gap-space-md mb-space-xl">
+<!-- Left Column: Core Engine, Storage & Cloudflare (7 Cols) -->
+<div class="xl:col-span-7 flex flex-col gap-space-md">
+<!-- Card 1: Goals Storage Backend -->
+<div class="bg-surface-container-low rounded-lg p-space-md flex flex-col justify-between">
+<div class="flex items-center justify-between pb-space-sm mb-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-primary text-base">database</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Goals Storage Backend Configuration</h2>
+</div>
+<div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container rounded">
+<span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>
+<span class="font-code-sm text-code-sm text-primary">Connected &amp; Healthy • 8ms</span>
+</div>
+</div>
+<!-- Mode Select Radio Cards -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-space-xs mb-space-md">
+<label class="p-space-sm rounded bg-surface-container cursor-pointer flex flex-col gap-space-2xs transition-all hover:bg-surface-container-high">
+<div class="flex items-center justify-between">
+<span class="font-code-md text-code-md text-on-surface font-semibold">Supabase Postgres</span>
+<span class="w-3.5 h-3.5 rounded-full bg-primary flex items-center justify-center">
+<span class="w-1.5 h-1.5 rounded-full bg-on-primary"></span>
+</span>
+</div>
+<span class="font-body-sm text-body-sm text-on-surface-variant">Remote managed cluster with pgvector real-time replication.</span>
+</label>
+<label class="p-space-sm rounded bg-surface-container-lowest cursor-pointer flex flex-col gap-space-2xs opacity-70 hover:opacity-100 transition-all">
+<div class="flex items-center justify-between">
+<span class="font-code-md text-code-md text-on-surface">Embedded SQLite FTS</span>
+<span class="w-3.5 h-3.5 rounded-full bg-surface-container-high"></span>
+</div>
+<span class="font-body-sm text-body-sm text-on-surface-variant">Air-gapped local zero-network store. High local IOPS.</span>
+</label>
+</div>
+<!-- Monospaced Connection Parameters -->
+<div class="space-y-space-xs font-code-sm text-code-sm">
+<div>
+<label class="text-on-surface-variant block mb-space-2xs font-label-sm text-label-sm uppercase">Target Connection URI</label>
+<div class="flex items-center justify-between px-space-sm py-space-xs bg-surface-container-lowest rounded text-on-surface">
+<span class="truncate">postgresql://postgres:••••••••••••@db.intentforge.internal:5432/goals</span>
+<button class="text-primary hover:text-primary-fixed shrink-0 ml-space-sm flex items-center gap-space-2xs" onclick="navigator.clipboard.writeText('postgresql://postgres:••••••••••••@db.intentforge.internal:5432/goals'); alert('Connection URI Copied');" type="button">
+<span class="material-symbols-outlined text-sm">content_copy</span>
+</button>
+</div>
+</div>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-space-xs">
+<div>
+<label class="text-on-surface-variant block mb-space-2xs font-label-sm text-label-sm uppercase">SSL Verification Mode</label>
+<div class="px-space-sm py-space-xs bg-surface-container-lowest rounded text-on-surface flex items-center justify-between">
+<span>verify-full</span>
+<span class="text-secondary font-label-sm text-label-sm uppercase">CA: Trusted</span>
+</div>
+</div>
+<div>
+<label class="text-on-surface-variant block mb-space-2xs font-label-sm text-label-sm uppercase">Delta Sync Interval</label>
+<div class="px-space-sm py-space-xs bg-surface-container-lowest rounded text-on-surface flex items-center justify-between">
+<span>300 seconds</span>
+<span class="text-on-surface-variant font-label-sm text-label-sm">PID: 41280</span>
+</div>
+</div>
+</div>
+</div>
+<div class="flex items-center justify-between pt-space-md mt-space-md">
+<span class="font-label-sm text-label-sm text-on-surface-variant">LAST WAL REPLICATION: 18 SECONDS AGO</span>
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm" onclick="showStateModal('state-toast')" type="button">Test Ping</button>
+<button class="px-space-md py-space-xs bg-primary-container text-on-primary-container hover:opacity-90 rounded font-code-sm text-code-sm font-semibold" onclick="showStateModal('state-toast')" type="button">Commit DB Sync</button>
+</div>
+</div>
+</div>
+<!-- Card 2: Cloudflare Tunnel & Zero-Trust Ingress -->
+<div class="bg-surface-container-low rounded-lg p-space-md">
+<div class="flex items-center justify-between pb-space-sm mb-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-secondary text-base">cloud_sync</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Cloudflare Tunnel &amp; Network Exposure</h2>
+</div>
+<div class="flex items-center gap-space-xs">
+<span class="w-2 h-2 rounded-full bg-secondary animate-pulse"></span>
+<span class="font-label-sm text-label-sm text-secondary uppercase font-semibold">TUNNEL: ACTIVE / ONLINE</span>
+</div>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-space-sm mb-space-md">
+<div class="p-space-sm bg-surface-container rounded space-y-space-2xs">
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase">Tunnel UUID</div>
+<div class="font-code-md text-code-md text-on-surface select-all">cf-tunnel-9f93-4a11-b001</div>
+<div class="font-body-sm text-body-sm text-on-surface-variant">Connector: cloudflared v2024.4.1 (linux/amd64)</div>
+</div>
+<div class="p-space-sm bg-surface-container rounded space-y-space-2xs">
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase">Public Ingress Route</div>
+<div class="font-code-md text-code-md text-secondary truncate">https://search.internal.corp.net</div>
+<div class="font-body-sm text-body-sm text-on-surface-variant">Edge PoP: FRA (Frankfurt am Main) • HTTP/3 QUIC</div>
+</div>
+</div>
+<div class="p-space-sm bg-surface-container-lowest rounded mb-space-md flex items-start gap-space-sm">
+<span class="material-symbols-outlined text-primary text-base mt-0.5">verified_user</span>
+<div class="min-w-0">
+<div class="font-headline-sm text-headline-sm text-on-surface">Zero-Trust Access Policy Enforced</div>
+<p class="font-body-sm text-body-sm text-on-surface-variant mt-space-2xs">Cloudflare Access layer validates corporate IdP token, TLS client certificates (mTLS), and geographic IP fencing before traffic enters the host container.</p>
+</div>
+</div>
+<div class="flex flex-wrap items-center justify-between gap-space-xs">
+<div class="flex items-center gap-space-xs">
+<span class="font-code-sm text-code-sm text-on-surface-variant">WARP Client Routing: <span class="text-primary font-medium">STRICT</span></span>
+</div>
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm" onclick="showStateModal('state-loading')" type="button">Restart Tunnel Daemon</button>
+<button class="px-space-sm py-space-xs bg-surface-container-high hover:bg-surface-variant text-secondary rounded font-code-sm text-code-sm" onclick="window.open('https://search.internal.corp.net', '_blank')" type="button">View DNS Route</button>
+</div>
+</div>
+</div>
+</div>
+<!-- Right Column: Cache, Rate Limiting & Density Settings (5 Cols) -->
+<div class="xl:col-span-5 flex flex-col gap-space-md">
+<!-- Card 3: Cache Controls & Index Invalidation -->
+<div class="bg-surface-container-low rounded-lg p-space-md">
+<div class="flex items-center justify-between pb-space-sm mb-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-primary text-base">cached</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Cache &amp; Index Invalidation</h2>
+</div>
+<span class="font-label-sm text-label-sm text-on-surface-variant">L1 + L2 SUB-LAYER</span>
+</div>
+<div class="space-y-space-xs mb-space-md font-code-sm text-code-sm">
+<div class="p-space-sm bg-surface-container rounded flex items-center justify-between">
+<div>
+<div class="text-on-surface font-medium">In-Memory L1 Cache</div>
+<div class="text-on-surface-variant font-body-sm text-body-sm">Key-value vector cache • 512 MB reserved</div>
+</div>
+<div class="text-right">
+<div class="text-primary font-semibold">94.1%</div>
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">HIT RATIO</div>
+</div>
+</div>
+<div class="p-space-sm bg-surface-container rounded flex items-center justify-between">
+<div>
+<div class="text-on-surface font-medium">NVMe Disk L2 Cache</div>
+<div class="text-on-surface-variant font-body-sm text-body-sm">SQLite FTS5 temporary segments</div>
+</div>
+<div class="text-right">
+<div class="text-on-surface font-semibold">8.4 GB</div>
+<div class="text-on-surface-variant font-label-sm text-label-sm uppercase">ALLOCATED</div>
+</div>
+</div>
+</div>
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-space-2xs">
+<button class="p-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface text-center rounded font-code-sm text-code-sm" onclick="showStateModal('state-loading')" type="button">
+            Purge L1/L2
+          </button>
+<button class="p-space-xs bg-surface-container hover:bg-surface-container-high text-primary text-center rounded font-code-sm text-code-sm" onclick="showStateModal('state-loading')" type="button">
+            Re-index FTS
+          </button>
+<button class="p-space-xs bg-surface-container hover:bg-surface-container-high text-secondary text-center rounded font-code-sm text-code-sm" onclick="showStateModal('state-toast')" type="button">
+            Warm Top 500
+          </button>
+</div>
+</div>
+<!-- Card 4: Rate Limiting & Abuse Prevention -->
+<div class="bg-surface-container-low rounded-lg p-space-md">
+<div class="flex items-center justify-between pb-space-sm mb-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-tertiary-container text-base">speed</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Rate Limiting &amp; Abuse Prevention</h2>
+</div>
+<span class="px-space-xs py-space-2xs bg-surface-container rounded text-primary font-label-sm text-label-sm uppercase">ACTIVE</span>
+</div>
+<div class="space-y-space-xs text-body-sm font-body-sm">
+<div class="flex items-center justify-between p-space-xs bg-surface-container rounded">
+<span class="text-on-surface-variant">Enforcement Policy</span>
+<span class="font-code-sm text-code-sm text-on-surface">Token Bucket (Leaky Ring)</span>
+</div>
+<div class="flex items-center justify-between p-space-xs bg-surface-container rounded">
+<span class="text-on-surface-variant">Max Throughput / IP</span>
+<span class="font-code-sm text-code-sm text-primary font-semibold">60 req / min (burst 90)</span>
+</div>
+<div class="flex items-center justify-between p-space-xs bg-surface-container rounded">
+<span class="text-on-surface-variant">Whitelisted Subnets</span>
+<span class="font-code-sm text-code-sm text-secondary truncate max-w-[180px]">192.168.1.0/24, 10.8.0.0/16</span>
+</div>
+<div class="flex items-center justify-between p-space-xs bg-surface-container rounded">
+<span class="text-on-surface-variant">Over-quota Action</span>
+<span class="font-code-sm text-code-sm text-error">Drop Silent (HTTP 429)</span>
+</div>
+</div>
+<div class="mt-space-sm flex items-center justify-between text-on-surface-variant font-code-sm text-code-sm">
+<span>Trigger header: <code class="text-on-surface">Retry-After: 60</code></span>
+<button class="text-primary hover:underline text-xs" onclick="showStateModal('state-429')" type="button">Simulate 429 Trap</button>
+</div>
+</div>
+<!-- Card 5: Interface Appearance & Density -->
+<div class="bg-surface-container-low rounded-lg p-space-md">
+<div class="flex items-center justify-between pb-space-sm mb-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-primary text-base">palette</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface">Interface Appearance &amp; Density</h2>
+</div>
+<span class="font-label-sm text-label-sm text-on-surface-variant">CLIENT PERSISTED</span>
+</div>
+<div class="space-y-space-sm">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase mb-space-2xs">Palette &amp; Contrast Tier</div>
+<div class="grid grid-cols-2 gap-space-xs">
+<div class="p-space-xs bg-surface-container rounded flex items-center justify-between cursor-pointer">
+<span class="font-body-sm text-body-sm text-on-surface font-semibold">Deep Ink Terminal</span>
+<span class="w-2.5 h-2.5 rounded-full bg-primary"></span>
+</div>
+<div class="p-space-xs bg-surface-container-lowest opacity-60 rounded flex items-center justify-between cursor-pointer hover:opacity-100">
+<span class="font-body-sm text-body-sm text-on-surface">Tactical Slate</span>
+<span class="w-2.5 h-2.5 rounded-full bg-surface-variant"></span>
+</div>
+</div>
+</div>
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase mb-space-2xs">Data Table Density</div>
+<div class="grid grid-cols-2 gap-space-xs font-code-sm text-code-sm">
+<div class="p-space-xs bg-surface-container rounded text-center text-primary font-semibold">
+                Ultra Dense (13px Mono)
+              </div>
+<div class="p-space-xs bg-surface-container-lowest text-center text-on-surface-variant rounded">
+                Standard (14px Sans)
+              </div>
+</div>
+</div>
+<div class="p-space-xs bg-surface-container-lowest rounded flex items-center justify-between text-body-sm text-body-sm">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-base text-on-surface-variant">keyboard</span>
+<span class="text-on-surface">Vim Navigation (<kbd class="font-kbd text-kbd px-1 bg-surface-container text-primary rounded">j</kbd>/<kbd class="font-kbd text-kbd px-1 bg-surface-container text-primary rounded">k</kbd>)</span>
+</div>
+<span class="font-label-sm text-label-sm text-primary uppercase">ENABLED</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- Explicit State Demonstrator & Diagnostics Control Deck -->
+<section class="bg-surface-container-lowest p-space-md rounded-lg mb-space-xl">
+<div class="flex flex-col md:flex-row md:items-center justify-between gap-space-sm pb-space-sm mb-space-md">
+<div>
+<div class="flex items-center gap-space-xs">
+<span class="w-2 h-2 rounded-full bg-primary-container"></span>
+<h3 class="font-headline-sm text-headline-sm text-on-surface">Diagnostics Deck: Interactive HTTP &amp; Lifecycle State Inspector</h3>
+</div>
+<p class="font-body-sm text-body-sm text-on-surface-variant mt-space-2xs">Trigger real mock system scenarios to verify client resilience, UI fault tolerance, and operational observability feedback loops.</p>
+</div>
+<div class="flex items-center gap-space-xs font-code-sm text-code-sm shrink-0">
+<span class="text-on-surface-variant">HOTKEY PREVIEW:</span>
+<kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface rounded">ESC</kbd>
+<span class="text-on-surface-variant">to close modal</span>
+</div>
+</div>
+<!-- State Launch Buttons Bento -->
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-space-xs">
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-empty')" type="button">
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase group-hover:text-primary">STATE A</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">Empty Query</div>
+<div class="font-code-sm text-code-sm text-on-surface-variant mt-1">Zero hits • fallback</div>
+</button>
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-loading')" type="button">
+<div class="font-label-sm text-label-sm text-on-surface-variant uppercase group-hover:text-primary">STATE B</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">HNSW Indexing</div>
+<div class="font-code-sm text-code-sm text-primary mt-1">48.2k chunks • 64%</div>
+</button>
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-400')" type="button">
+<div class="font-label-sm text-label-sm text-error uppercase group-hover:text-error">STATE C</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">Error 400 Bad AST</div>
+<div class="font-code-sm text-code-sm text-on-surface-variant mt-1">Lexer syntax fail</div>
+</button>
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-403')" type="button">
+<div class="font-label-sm text-label-sm text-tertiary-container uppercase group-hover:text-tertiary-fixed">STATE D</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">Error 403 ACL</div>
+<div class="font-code-sm text-code-sm text-on-surface-variant mt-1">Bearer unauthorized</div>
+</button>
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-429')" type="button">
+<div class="font-label-sm text-label-sm text-error uppercase group-hover:text-error">STATE E</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">Error 429 Limit</div>
+<div class="font-code-sm text-code-sm text-on-surface-variant mt-1">Backoff 48s trap</div>
+</button>
+<button class="p-space-sm bg-surface-container-low hover:bg-surface-container rounded text-left group transition-colors" onclick="showStateModal('state-toast')" type="button">
+<div class="font-label-sm text-label-sm text-primary uppercase group-hover:text-primary-fixed">STATE F</div>
+<div class="font-headline-sm text-headline-sm text-on-surface font-semibold truncate mt-space-2xs">Sync Success</div>
+<div class="font-code-sm text-code-sm text-primary mt-1">config.toml saved</div>
+</button>
+</div>
+</section>
+<!-- ========================================================================= -->
+<!-- MODALS CONTAINER FOR EXPLICIT SYSTEM STATES (Controlled via Vanilla JS) -->
+<!-- ========================================================================= -->
+<div class="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-space-md hidden backdrop-blur-sm" id="state-modal-backdrop">
+<!-- State A: Empty Results State Modal -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-empty">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant font-code-sm text-code-sm rounded">QUERY_EMPTY (0x00)</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Diagnostics Response</span>
+</div>
+<button class="text-on-surface-variant hover:text-on-surface" onclick="closeStateModal()" type="button">
+<span class="material-symbols-outlined text-base">close</span>
+</button>
+</div>
+<div class="text-center py-space-lg px-space-md bg-surface-container-lowest rounded mb-space-md">
+<div class="w-12 h-12 rounded bg-surface-container-high text-on-surface-variant mx-auto flex items-center justify-center mb-space-sm">
+<span class="material-symbols-outlined text-2xl">search_off</span>
+</div>
+<h4 class="font-headline-md text-headline-md text-on-surface font-semibold">Zero Matching Records Found</h4>
+<p class="font-body-md text-body-md text-on-surface-variant mt-space-xs max-w-md mx-auto">
+          No documents matched your execution query with strict constraint <code class="text-primary font-code-sm text-code-sm bg-surface-container px-1 py-0.5 rounded">filetype:wasm</code> and embedding threshold <code class="text-secondary font-code-sm text-code-sm bg-surface-container px-1 py-0.5 rounded">&gt;= 0.95</code>.
+        </p>
+<div class="mt-space-md flex flex-wrap justify-center gap-space-xs">
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-variant text-primary rounded font-code-sm text-code-sm" onclick="alert('Relaxing filter to 0.70'); closeStateModal();" type="button">Relax Threshold to 0.70</button>
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-variant text-secondary rounded font-code-sm text-code-sm" onclick="alert('Toggled Federated Web Fallback'); closeStateModal();" type="button">Toggle Federated Web Fallback</button>
+</div>
+</div>
+<div class="flex items-center justify-between font-code-sm text-code-sm text-on-surface-variant">
+<span>Scanned: 4.21M vector blocks in 1.48ms</span>
+<button class="px-space-md py-space-xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded" onclick="closeStateModal()" type="button">Dismiss View</button>
+</div>
+</div>
+<!-- State B: Loading & Live Vector Re-indexing State -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-loading">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="w-2 h-2 rounded-full bg-primary animate-ping"></span>
+<span class="font-headline-sm text-headline-sm text-on-surface">Background Task In Progress</span>
+</div>
+<span class="font-code-sm text-code-sm text-primary font-semibold">JOB: #84920</span>
+</div>
+<div class="p-space-md bg-surface-container-lowest rounded mb-space-md space-y-space-md">
+<div class="flex items-center justify-between">
+<span class="font-code-md text-code-md text-on-surface font-medium truncate">Building HNSW Vector Graph: arxiv-security-2024</span>
+<span class="font-code-md text-code-md text-primary font-semibold shrink-0">64%</span>
+</div>
+<!-- Terminal Progress Bar -->
+<div class="w-full h-3 bg-surface-container-high rounded overflow-hidden p-0.5">
+<div class="h-full bg-primary-container rounded transition-all duration-300 w-[64%]"></div>
+</div>
+<!-- Monospaced Telemetry Block -->
+<div class="space-y-space-2xs font-code-sm text-code-sm text-on-surface-variant">
+<div class="flex justify-between"><span>Processed:</span> <span class="text-on-surface">30,848 / 48,200 chunks</span></div>
+<div class="flex justify-between"><span>Throughput:</span> <span class="text-on-surface">1,410 chunks/sec</span></div>
+<div class="flex justify-between"><span>Memory Overhead:</span> <span class="text-on-surface">1.12 GB (HNSW Level M=16, ef=64)</span></div>
+<div class="flex justify-between"><span>Estimated Remaining:</span> <span class="text-secondary font-semibold">12 seconds</span></div>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<span class="font-code-sm text-code-sm text-on-surface-variant">Thread Pool: 8 Cores (AVX-512)</span>
+<button class="px-space-md py-space-xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm" onclick="closeStateModal()" type="button">Send to Background</button>
+</div>
+</div>
+<!-- State C: Error 400 Bad Query AST State -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-400">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="px-space-xs py-space-2xs bg-error-container text-on-error-container font-code-sm text-code-sm rounded font-semibold">HTTP 400 BAD REQUEST</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Parser Exception</span>
+</div>
+<button class="text-on-surface-variant hover:text-on-surface" onclick="closeStateModal()" type="button">
+<span class="material-symbols-outlined text-base">close</span>
+</button>
+</div>
+<div class="p-space-md bg-surface-container-lowest rounded mb-space-md">
+<div class="text-error font-headline-sm text-headline-sm font-semibold mb-space-xs">QueryASTLexerError: Unterminated Quoted Literal</div>
+<p class="font-body-sm text-body-sm text-on-surface-variant mb-space-md">The search parser encountered an unexpected EOF while consuming an escaped literal delimiter.</p>
+<!-- Code snippet with red indicator pointer -->
+<div class="p-space-sm bg-surface-container rounded font-code-md text-code-md text-on-surface overflow-x-auto">
+<div><span class="text-on-surface-variant">1 |</span> <span class="text-primary">scope:hybrid</span> <span class="text-secondary">author:</span><span class="text-error">"alec_mcdermott</span> <span class="text-on-surface-variant">--rank:bm25</span></div>
+<div class="text-error font-semibold"><span class="text-on-surface-variant">  |</span> <span class="underline decoration-wavy">^^^^^^^^^^^^^^^^</span> <span class="text-on-surface-variant">[E0021 Missing closing quote]</span></div>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<span class="font-code-sm text-code-sm text-on-surface-variant">Suggestion: Append <code class="text-on-surface">"</code> at column 32</span>
+<button class="px-space-md py-space-xs bg-primary-container text-on-primary-container rounded font-code-sm text-code-sm font-semibold" onclick="closeStateModal()" type="button">Auto-Fix AST &amp; Re-run</button>
+</div>
+</div>
+<!-- State D: Error 403 Forbidden ACL State -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-403">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-tertiary-container font-code-sm text-code-sm rounded font-semibold">HTTP 403 FORBIDDEN</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">RBAC Policy Violation</span>
+</div>
+<button class="text-on-surface-variant hover:text-on-surface" onclick="closeStateModal()" type="button">
+<span class="material-symbols-outlined text-base">close</span>
+</button>
+</div>
+<div class="p-space-md bg-surface-container-lowest rounded mb-space-md">
+<div class="flex items-start gap-space-sm">
+<span class="material-symbols-outlined text-tertiary-container text-2xl mt-0.5">gpp_bad</span>
+<div>
+<h4 class="font-headline-sm text-headline-sm text-on-surface font-semibold">Unauthorized Scope: [telemetry:inspect]</h4>
+<p class="font-body-sm text-body-sm text-on-surface-variant mt-space-2xs">The presented API Key <code class="text-on-surface font-code-sm text-code-sm">if_live_90f2...e4a1</code> belongs to the role <strong class="text-on-surface">Reader-Junior</strong> which lacks execution clearance for endpoint <code class="text-secondary font-code-sm text-code-sm">/v2/telemetry/inspect</code>.</p>
+</div>
+</div>
+<div class="mt-space-md p-space-xs bg-surface-container rounded font-code-sm text-code-sm space-y-space-2xs">
+<div class="text-on-surface-variant">Subject: <span class="text-on-surface">researcher-bot-04@corp.internal</span></div>
+<div class="text-on-surface-variant">Required Role: <span class="text-primary font-semibold">SecOps-Admin OR Node-Operator</span></div>
+<div class="text-on-surface-variant">Access Trace ID: <span class="text-on-surface select-all">cf-sec-trace-20240502-182931</span></div>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<span class="font-code-sm text-code-sm text-on-surface-variant">mTLS cert verified, token scope insufficient.</span>
+<button class="px-space-md py-space-xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm" onclick="closeStateModal()" type="button">Request Scope Escalation</button>
+</div>
+</div>
+<!-- State E: Error 429 Rate Limit Exceeded State -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-429">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="px-space-xs py-space-2xs bg-error-container text-on-error-container font-code-sm text-code-sm rounded font-semibold">HTTP 429 TOO MANY REQUESTS</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Rate Throttled</span>
+</div>
+<button class="text-on-surface-variant hover:text-on-surface" onclick="closeStateModal()" type="button">
+<span class="material-symbols-outlined text-base">close</span>
+</button>
+</div>
+<div class="p-space-md bg-surface-container-lowest rounded mb-space-md text-center">
+<div class="font-display-lg text-display-lg text-error font-semibold tracking-tight" id="rate-countdown">48s</div>
+<div class="font-headline-sm text-headline-sm text-on-surface mt-space-2xs">Backoff Penalty Window Active</div>
+<p class="font-body-sm text-body-sm text-on-surface-variant mt-space-xs max-w-md mx-auto">
+          Client IP <code class="text-on-surface font-code-sm text-code-sm">178.62.204.19</code> exceeded maximum quota of 60 req/min (triggered: 94 calls in 12s). Further ingress packets dropped silently.
+        </p>
+<div class="mt-space-md inline-flex items-center gap-space-xs px-space-md py-space-xs bg-surface-container rounded font-code-sm text-code-sm text-secondary">
+<span class="material-symbols-outlined text-sm">schedule</span>
+<span>Header: Retry-After: 48</span>
+</div>
+</div>
+<div class="flex items-center justify-between">
+<span class="font-code-sm text-code-sm text-on-surface-variant">Subnet: Public Ingress (Untrusted)</span>
+<button class="px-space-md py-space-xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm" onclick="closeStateModal()" type="button">Acknowledge Backoff</button>
+</div>
+</div>
+<!-- State F: Success Notification Modal / Card -->
+<div class="state-modal-panel w-full max-w-xl bg-surface-container-low rounded-lg p-space-lg shadow-2xl hidden" id="state-toast">
+<div class="flex items-center justify-between pb-space-sm mb-space-md">
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-primary text-base">check_circle</span>
+<span class="font-headline-sm text-headline-sm text-on-surface font-semibold">Node Settings Persisted</span>
+</div>
+<span class="px-space-xs py-space-2xs bg-surface-container text-primary font-label-sm text-label-sm uppercase rounded">ATOMIC_WRITE_OK</span>
+</div>
+<div class="p-space-md bg-surface-container-lowest rounded mb-space-md">
+<p class="font-body-sm text-body-sm text-on-surface-variant mb-space-sm">Configuration updates have been committed to local NVMe and synchronized across active tunnel workers.</p>
+<div class="bg-surface-container p-space-sm rounded font-code-sm text-code-sm text-on-surface space-y-space-2xs overflow-x-auto">
+<div><span class="text-on-surface-variant"># Target File:</span> ~/.config/intentforge/config.toml</div>
+<div><span class="text-primary">[storage]</span> backend = "supabase_postgres"</div>
+<div><span class="text-primary">[tunnel]</span> active = true | ingress = "search.internal.corp.net"</div>
+<div><span class="text-primary">[cache]</span> l1_mb = 512 | fts5_sync = true</div>
+<div class="text-on-surface-variant"># SHA256: 8a7c29be01ff49d81204857b29381c9a44fa</div>
+</div>
+</div>
+<div class="flex items-center justify-end gap-space-xs">
+<button class="px-space-md py-space-xs bg-primary-container text-on-primary-container hover:opacity-90 rounded font-code-sm text-code-sm font-semibold" onclick="closeStateModal()" type="button">Dismiss</button>
+</div>
+</div>
+</div>
+<!-- Inline Client Controller Script -->
+<script>
+    function showStateModal(targetId) {
+      const backdrop = document.getElementById('state-modal-backdrop');
+      const allPanels = document.querySelectorAll('.state-modal-panel');
+      
+      allPanels.forEach(p => p.classList.add('hidden'));
+      backdrop.classList.remove('hidden');
+      
+      const target = document.getElementById(targetId);
+      if (target) {
+        target.classList.remove('hidden');
+      }
+
+      // If rate limit state, trigger simple interval visual
+      if (targetId === 'state-429') {
+        let sec = 48;
+        const el = document.getElementById('rate-countdown');
+        el.innerText = sec + 's';
+      }
+    }
+
+    function closeStateModal() {
+      const backdrop = document.getElementById('state-modal-backdrop');
+      backdrop.classList.add('hidden');
+      const allPanels = document.querySelectorAll('.state-modal-panel');
+      allPanels.forEach(p => p.classList.add('hidden'));
+    }
+
+    // Close on Escape key press
+    document.addEventListener('keydown', function(event) {
+      if (event.key === 'Escape') {
+        closeStateModal();
+      }
+    });
+
+    // Close if clicked backdrop outside panel
+    document.getElementById('state-modal-backdrop').addEventListener('click', function(event) {
+      if (event.target === this) {
+        closeStateModal();
+      }
+    });
+  </script>
+</div></main></div></body></html>

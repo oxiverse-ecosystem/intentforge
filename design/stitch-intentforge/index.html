@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>IntentForge UI — Stitch Prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --ink: #080f17;
+    --panel: #0d1620;
+    --panel-2: #111d29;
+    --line: #1e2c3a;
+    --line-soft: #172431;
+    --text: #e8f1f5;
+    --muted: #8ba0ad;
+    --primary: #00e5b3;
+    --secondary: #38bdf8;
+    --tertiary: #f59e0b;
+    --radius: 10px;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font-family: Inter, system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, a { font: inherit; }
+  a { color: inherit; }
+
+  .shell { display: grid; grid-template-columns: 296px minmax(0, 1fr); height: 100vh; }
+
+  /* Left rail — operate surface, not a marketing sidebar */
+  .rail {
+    display: flex; flex-direction: column; min-height: 0;
+    background: var(--panel); border-right: 1px solid var(--line);
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 18px 14px; border-bottom: 1px solid var(--line-soft);
+  }
+  .mark {
+    width: 30px; height: 30px; display: grid; place-items: center;
+    border: 1px solid var(--primary); color: var(--primary);
+    border-radius: 7px; font-family: var(--mono); font-size: 14px;
+  }
+  .brand-title { font-weight: 650; letter-spacing: -0.01em; }
+  .brand-sub { color: var(--muted); font-family: var(--mono); font-size: 10px; margin-top: 2px; }
+
+  .rail-label {
+    padding: 18px 18px 8px; color: var(--muted);
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+  }
+  .screens { list-style: none; margin: 0; padding: 0 10px; overflow-y: auto; }
+  .screen-btn {
+    width: 100%; display: grid; grid-template-columns: 28px 1fr; gap: 10px;
+    align-items: start; text-align: left; padding: 11px 10px;
+    background: transparent; color: var(--text); border: 1px solid transparent;
+    border-radius: var(--radius); cursor: pointer; transition: background .15s, border-color .15s;
+  }
+  .screen-btn:hover { background: var(--panel-2); }
+  .screen-btn[aria-current="true"] {
+    background: var(--panel-2); border-color: #294055;
+  }
+  .screen-btn[aria-current="true"] .num { color: var(--primary); border-color: var(--primary); }
+  .num {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 5px; text-align: center;
+    padding: 3px 0; line-height: 1;
+  }
+  .screen-name { font-size: 13px; font-weight: 550; letter-spacing: -0.005em; }
+  .screen-desc { color: var(--muted); font-size: 11px; margin-top: 3px; line-height: 1.4; }
+
+  .rail-foot { margin-top: auto; padding: 14px 18px 18px; border-top: 1px solid var(--line-soft); }
+  .rail-foot a { color: var(--muted); text-decoration: none; display: block; padding: 4px 0; font-size: 11px; }
+  .rail-foot a:hover { color: var(--primary); }
+  .kbd { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  .kbd b { color: var(--text); font-weight: 500; }
+
+  /* Main canvas */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .bar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  .bar h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  .bar .meta { color: var(--muted); font-family: var(--mono); font-size: 10px; }
+  .bar .spacer { flex: 1; }
+  .btn {
+    border: 1px solid var(--line); background: transparent; color: var(--text);
+    border-radius: 7px; padding: 7px 11px; cursor: pointer; font-size: 12px;
+  }
+  .btn:hover { border-color: var(--primary); color: var(--primary); }
+  .btn.primary { border-color: var(--primary); color: var(--primary); }
+  .viewport { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .viewport button {
+    border: 0; background: transparent; color: var(--muted); padding: 7px 10px; cursor: pointer; font-size: 11px;
+  }
+  .viewport button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
+
+  .stage {
+    flex: 1; min-height: 0; padding: 18px;
+    background:
+      radial-gradient(circle at 1px 1px, #162636 1px, transparent 0) 0 0 / 22px 22px,
+      var(--ink);
+    display: flex; justify-content: center; overflow: auto;
+  }
+  .frame-wrap {
+    width: 100%; max-width: 1440px; height: 100%;
+    background: #0a121b; border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; box-shadow: 0 18px 60px rgba(0,0,0,.45);
+    transition: width .2s ease;
+  }
+  .frame-wrap.mobile { max-width: 420px; }
+  iframe { width: 100%; height: 100%; border: 0; display: block; background: #080f17; }
+
+  .notice {
+    padding: 9px 18px; border-top: 1px solid var(--line-soft); background: var(--panel);
+    color: var(--muted); font-size: 11px; font-family: var(--mono);
+  }
+  .notice b { color: var(--tertiary); font-weight: 500; }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); }
+    .rail { border-right: 0; border-bottom: 1px solid var(--line); }
+    .brand { padding: 10px 14px; }
+    .rail-label, .rail-foot, .screen-desc { display: none; }
+    .screens { display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px; }
+    .screen-btn { width: auto; display: flex; align-items: center; padding: 7px 10px; white-space: nowrap; }
+    .stage { padding: 8px; }
+    .notice { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">
+      <div class="mark">&gt;_</div>
+      <div>
+        <div class="brand-title">IntentForge</div>
+        <div class="brand-sub">UI PROTOTYPE / STITCH</div>
+      </div>
+    </div>
+    <div class="rail-label">Screens</div>
+    <ul class="screens" id="screens"></ul>
+    <div class="rail-foot">
+      <a href="https://stitch.google.com/projects/15795196413537648124" target="_blank" rel="noopener">Stitch source project ↗</a>
+      <a href="https://api.oxiverse.com/health" target="_blank" rel="noopener">Live gateway health ↗</a>
+      <div class="kbd" style="margin-top:10px"><b>1–5</b> switch screen · <b>↑ ↓</b> navigate</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="bar">
+      <h1 id="title">Search &amp; Reasoning Inspector</h1>
+      <span class="meta" id="counter">01 / 05</span>
+      <span class="spacer"></span>
+      <div class="viewport" role="group" aria-label="Viewport width">
+        <button id="desktop" aria-pressed="true">Desktop</button>
+        <button id="mobile" aria-pressed="false">Mobile</button>
+      </div>
+      <button class="btn" id="open">Open screen ↗</button>
+    </div>
+    <div class="stage">
+      <div class="frame-wrap" id="wrap">
+        <iframe id="frame" title="Selected IntentForge screen" src="01-search.html"></iframe>
+      </div>
+    </div>
+    <div class="notice"><b>STATIC DESIGN ARTIFACT</b> · Generated by Google Stitch from the IntentForge API brief. Screens are layout prototypes, not wired to the live gateway.</div>
+  </main>
+</div>
+
+<script>
+  const screens = [
+    { file: "01-search.html", name: "Search & Reasoning Inspector", desc: "Query, operator chips, results, intent/spell/geo rail" },
+    { file: "02-media.html", name: "Media & Verticals", desc: "Images, videos, news and shopping surfaces" },
+    { file: "03-goals.html", name: "Goals Engine & Roadmaps", desc: "Create, answer, phased roadmap, leaderboard" },
+    { file: "04-api.html", name: "Developer API Console", desc: "Endpoint explorer, request/response, operators" },
+    { file: "05-settings.html", name: "Node Settings & Diagnostics", desc: "Backend, tunnel, cache, rate limits, theme" }
+  ];
+  const list = document.getElementById("screens");
+  const frame = document.getElementById("frame");
+  const wrap = document.getElementById("wrap");
+  const title = document.getElementById("title");
+  const counter = document.getElementById("counter");
+  let current = 0;
+
+  screens.forEach((s, i) => {
+    const li = document.createElement("li");
+    const b = document.createElement("button");
+    b.className = "screen-btn";
+    b.innerHTML = `<span class="num">${String(i + 1).padStart(2, "0")}</span><span><span class="screen-name">${s.name}</span><span class="screen-desc">${s.desc}</span></span>`;
+    b.addEventListener("click", () => select(i));
+    li.appendChild(b);
+    list.appendChild(li);
+  });
+
+  function select(i, persist = true) {
+    current = (i + screens.length) % screens.length;
+    const s = screens[current];
+    frame.src = s.file;
+    title.textContent = s.name;
+    counter.textContent = `${String(current + 1).padStart(2, "0")} / ${String(screens.length).padStart(2, "0")}`;
+    [...list.querySelectorAll("button")].forEach((b, n) => b.setAttribute("aria-current", n === current ? "true" : "false"));
+    if (persist) localStorage.setItem("if-stitch-screen", String(current));
+  }
+
+  document.getElementById("open").addEventListener("click", () => window.open(screens[current].file, "_blank", "noopener"));
+  const desktop = document.getElementById("desktop");
+  const mobile = document.getElementById("mobile");
+  function viewport(mode) {
+    wrap.classList.toggle("mobile", mode === "mobile");
+    desktop.setAttribute("aria-pressed", String(mode !== "mobile"));
+    mobile.setAttribute("aria-pressed", String(mode === "mobile"));
+    localStorage.setItem("if-stitch-viewport", mode);
+  }
+  desktop.addEventListener("click", () => viewport("desktop"));
+  mobile.addEventListener("click", () => viewport("mobile"));
+
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+    if (/^[1-5]$/.test(e.key)) select(Number(e.key) - 1);
+    else if (e.key === "ArrowDown") select(current + 1);
+    else if (e.key === "ArrowUp") select(current - 1);
+  });
+
+  const saved = Number(localStorage.getItem("if-stitch-screen"));
+  select(Number.isInteger(saved) && saved >= 0 && saved < screens.length ? saved : 0, false);
+  viewport(localStorage.getItem("if-stitch-viewport") || "desktop");
+</script>
+</body>
+</html>
