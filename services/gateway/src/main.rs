@@ -765,11 +765,18 @@ fn invidious_video_result(r: &InvidiousResult, q: &str) -> Option<VideoResult> {
         return None;
     }
     let description = r.description.clone().unwrap_or_default();
-    let terms: Vec<&str> = q.split_whitespace().filter(|w| w.chars().count() > 2).collect();
+    // Stopwords inflate coverage without adding topical signal.
+    let stopwords = ["the", "and", "for", "with", "how", "what", "best", "your",
+                     "from", "into", "that", "this", "why", "does", "can", "you", "are"];
+    let terms: Vec<&str> = q.split_whitespace()
+        .filter(|w| w.chars().count() > 2 && !stopwords.contains(&w.to_lowercase().as_str()))
+        .collect();
     let haystack = format!("{} {}", title.to_lowercase(), description.to_lowercase());
     let hits = terms.iter().filter(|t| haystack.contains(&t.to_lowercase())).count();
     let coverage = if terms.is_empty() { 0.0 } else { hits as f32 / terms.len() as f32 };
-    let score = (0.88 + 0.12 * coverage).min(1.0);
+    // Strong coverage can reach the top of SearXNG's band; weak matches stay
+    // below typical web rows instead of occupying the first five slots.
+    let score = (0.55 + 0.40 * coverage).min(0.95);
     Some(VideoResult {
         title,
         url: format!("https://www.youtube.com/watch?v={}", vid),
@@ -13989,7 +13996,9 @@ async fn handle_videos(
     );
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
+        // Cached body is the full merged set; apply the same default page size
+        // on cache hits as on cold responses.
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, effective_media_limit(params.limit, VIDEOS_DEFAULT_LIMIT))));
     }
 
     // Resolve client geolocation for location-aware video search
@@ -27363,7 +27372,21 @@ mod video_ranking_tests {
         let a = invidious_video_result(&good, "rust programming").unwrap();
         let b = invidious_video_result(&poor, "rust programming").unwrap();
         assert!(a.score > b.score, "relevant title must score higher");
-        assert!((0.88..=1.0).contains(&a.score), "score must be in the SearXNG band");
+        assert!((0.55..=0.95).contains(&a.score), "score must reflect coverage, not a high floor");
+        assert!(b.score < 0.9, "weak matches must not outrank typical web rows");
+    }
+
+    #[test]
+    fn invidious_coverage_ignores_stopwords() {
+        let row = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Rust programming tutorial".into()),
+            video_id: Some("x".into()),
+            description: None,
+        };
+        let plain = invidious_video_result(&row, "rust programming").unwrap().score;
+        let with_stopwords = invidious_video_result(&row, "the rust and programming").unwrap().score;
+        assert_eq!(plain, with_stopwords, "stopwords must not inflate coverage");
     }
 
     #[test]

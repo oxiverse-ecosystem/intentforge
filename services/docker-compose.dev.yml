@@ -232,12 +232,30 @@ services:
     volumes:
       - invidious-db-data-dev:/var/lib/postgresql/data
 
+  # One-shot schema init: a fresh Invidious DB has no tables, which makes
+  # /api/v1/videos fail with "relation videos does not exist". Retry until the
+  # DB accepts connections, then exit; invidious waits for successful completion.
+  invidious-migrate:
+    container_name: if-dev-invidious-migrate
+    image: quay.io/invidious/invidious:latest
+    depends_on:
+      - invidious-db
+    environment:
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:***@invidious-db:5432/invidious
+      - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
+    entrypoint: ["/bin/sh", "-c"]
+    command: 'i=0; while [ $$i -lt 30 ]; do /invidious/invidious --migrate && exit 0; i=$$((i+1)); sleep 2; done; echo "invidious migration failed"; exit 1'
+    restart: "no"
+
   invidious:
     container_name: if-dev-invidious
     mem_limit: 512m
     image: quay.io/invidious/invidious:latest
     depends_on:
-      - invidious-db
+      invidious-db:
+        condition: service_started
+      invidious-migrate:
+        condition: service_completed_successfully
     environment:
       - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@invidious-db:5432/invidious
       - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321

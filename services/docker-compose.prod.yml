@@ -157,12 +157,29 @@ services:
     volumes:
       - invidious-db-data:/var/lib/postgresql/data
 
+  # One-shot schema init for a fresh Invidious DB (see dev compose).
+  invidious-migrate:
+    container_name: if-invidious-migrate
+    image: quay.io/invidious/invidious:latest
+    network_mode: "service:gluetun"
+    depends_on:
+      - invidious-db
+    environment:
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
+      - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
+    entrypoint: ["/bin/sh", "-c"]
+    command: 'i=0; while [ $$i -lt 30 ]; do /invidious/invidious --migrate && exit 0; i=$$((i+1)); sleep 2; done; echo "invidious migration failed"; exit 1'
+    restart: "no"
+
   invidious:
     container_name: if-invidious
     image: quay.io/invidious/invidious:latest
     network_mode: "service:gluetun"
     depends_on:
-      - invidious-db
+      invidious-db:
+        condition: service_started
+      invidious-migrate:
+        condition: service_completed_successfully
     environment:
       - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
       - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
