@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_dashboard" name="shell-type"/><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config={darkMode:"class",theme:{extend:{colors:{"surface-container":"#1c2028","error":"#ffb4ab","on-error":"#690005","on-primary":"#00382a","surface-tint":"#00e0af","surface-container-low":"#181c24","secondary-fixed-dim":"#7bd0ff","error-container":"#93000a","surface-container-high":"#262a33","outline-variant":"#3b4a43","primary-fixed-dim":"#00e0af","surface-variant":"#31353e","on-tertiary":"#472a00","surface":"#0f131c","on-primary-container":"#00614a","on-tertiary-fixed":"#2a1700","on-primary-fixed-variant":"#00513d","tertiary-container":"#ffbe6d","on-secondary-container":"#00374d","on-secondary":"#00354a","inverse-surface":"#dfe2ee","on-tertiary-container":"#784b00","on-surface":"#dfe2ee","background":"#0f131c","on-primary-fixed":"#002117","tertiary-fixed":"#ffddb8","tertiary-fixed-dim":"#ffb95f","on-secondary-fixed":"#001e2c","inverse-primary":"#006c53","surface-container-lowest":"#0a0e16","secondary-container":"#00a6e0","on-surface-variant":"#bacac2","primary-container":"#00e5b3","outline":"#84948c","tertiary":"#ffe2c3","surface-dim":"#0f131c","on-tertiary-fixed-variant":"#653e00","on-error-container":"#ffdad6","surface-container-highest":"#31353e","on-secondary-fixed-variant":"#004c69","secondary-fixed":"#c4e7ff","inverse-on-surface":"#2c3039","primary-fixed":"#42feca","secondary":"#7bd0ff","primary":"#6fffd1","surface-bright":"#353942","on-background":"#dfe2ee"},borderRadius:{"DEFAULT":"0.125rem","lg":"0.25rem","xl":"0.5rem","full":"0.75rem"},spacing:{"margin":"1rem","gutter":"0.75rem","space-2xl":"2rem","space-xs":"0.25rem","space-xl":"1.5rem","space-md":"0.75rem","space-sm":"0.5rem","space-2xs":"0.125rem","margin-md":"1.5rem","gutter-md":"1rem","space-lg":"1rem"},fontFamily:{"label-md":["JetBrains Mono"],"display-lg":["Inter"],"code-md":["JetBrains Mono"],"body-lg":["Inter"],"kbd":["JetBrains Mono"],"headline-lg-mobile":["Inter"],"headline-sm":["Inter"],"code-sm":["JetBrains Mono"],"code-lg":["JetBrains Mono"],"label-sm":["JetBrains Mono"],"headline-lg":["Inter"],"body-md":["Inter"],"body-sm":["Inter"],"headline-md":["Inter"]},fontSize:{"label-md":["11px",{"lineHeight":"14px","letterSpacing":"0.06em","fontWeight":"600"}],"display-lg":["30px",{"lineHeight":"38px","letterSpacing":"-0.025em","fontWeight":"600"}],"code-md":["12px",{"lineHeight":"18px","letterSpacing":"-0.01em","fontWeight":"400"}],"body-lg":["14px",{"lineHeight":"22px","letterSpacing":"0em","fontWeight":"400"}],"kbd":["10px",{"lineHeight":"10px","letterSpacing":"0.02em","fontWeight":"600"}],"headline-lg-mobile":["18px",{"lineHeight":"24px","letterSpacing":"-0.015em","fontWeight":"600"}],"headline-sm":["14px",{"lineHeight":"20px","letterSpacing":"-0.005em","fontWeight":"600"}],"code-sm":["11px",{"lineHeight":"15px","letterSpacing":"0em","fontWeight":"400"}],"code-lg":["13px",{"lineHeight":"20px","letterSpacing":"-0.01em","fontWeight":"500"}],"label-sm":["10px",{"lineHeight":"12px","letterSpacing":"0.08em","fontWeight":"500"}],"headline-lg":["22px",{"lineHeight":"28px","letterSpacing":"-0.02em","fontWeight":"600"}],"body-md":["13px",{"lineHeight":"19px","letterSpacing":"0em","fontWeight":"400"}],"body-sm":["12px",{"lineHeight":"16px","letterSpacing":"0.01em","fontWeight":"400"}],"headline-md":["16px",{"lineHeight":"22px","letterSpacing":"-0.01em","fontWeight":"600"}]}}}};</script></head><body class="bg-background font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 inset-x-0 z-50 bg-surface-container-lowest"><div class="h-14 w-full px-gutter-md flex items-center justify-between gap-space-md"><div class="flex items-center gap-space-md min-w-0"><div class="flex items-center gap-space-sm shrink-0"><span class="w-2 h-2 rounded-full bg-primary-container animate-pulse"></span><span class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight">IntentForge <span class="text-primary font-code-md text-code-md font-medium">v2</span></span></div><div class="hidden xl:flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">SELF-HOSTED // node-01-sgx // 14ms latency</span></div></div><div class="flex-1 max-w-xl mx-space-md hidden md:block"><div class="w-full flex items-center justify-between px-space-md py-space-xs bg-surface-container-low rounded"><div class="flex items-center gap-space-sm min-w-0"><span class="font-code-md text-code-md text-primary font-medium shrink-0">&gt;_</span><span class="font-code-md text-code-md text-on-surface-variant truncate">scope:hybrid intent:crawl --live</span></div><div class="flex items-center gap-space-xs shrink-0"><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">/</kbd><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">⌘K</kbd></div></div></div><div class="flex items-center gap-space-md shrink-0"><div class="hidden lg:flex items-center gap-space-sm"><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Vector Sync: <span class="text-on-surface font-code-sm text-code-sm">4.2M docs</span></span></div><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-secondary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Tunnel: <span class="text-secondary font-code-sm text-code-sm">ACTIVE</span></span></div></div><div class="flex items-center gap-space-sm"><button class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs" type="button"><span class="material-symbols-outlined text-sm text-primary">terminal</span><span class="hidden sm:inline">DEV</span></button><img alt="Profile" class="w-8 h-8 rounded-full object-cover" src="https://lh3.googleusercontent.com/aida/ALJJyrAfkFzl8qQWjIuA1o8YDioW6crvCUXIcVbnhpB8o23rl9Mr6L0r5TVsg7hwd-OHqLU_dsGv_jMHnClm46hgEeS5gD_ed39I7lOB56J6zDz-nJ8mu1Ox7MNTBM6HnmOVINJFLWOC7f8dhDcNUAaZQrmRba13qMfei8CsBh78jnQ1L4bdaGOT9PmCwrnwMFRb4Hc9BU2cbqZXm_BASYNkrJSfS2HSBVz__oke29nXGKGu"/></div></div></div><div class="w-full px-gutter-md bg-surface-container-low"><div class="flex items-center justify-between overflow-x-auto"><nav class="flex items-center gap-space-xs py-space-2xs" data-active-classes="text-primary font-semibold bg-surface-container"><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="search-and-inspect" href="#">Search &amp; Inspect</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="media-and-verticals" href="#">Media &amp; Verticals</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="goals-engine" href="#">Goals Engine</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="developer-api" href="#">Developer API</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="node-settings" href="#">Node Settings</a></nav><div class="hidden sm:flex items-center gap-space-sm py-space-2xs text-on-surface-variant"><span class="font-code-sm text-code-sm">SYS_OK</span><span class="font-code-sm text-code-sm text-outline-variant">|</span><span class="font-code-sm text-code-sm">ENC:AES-256</span></div></div></div></header><aside class="fixed left-0 top-24 bottom-0 w-64 bg-surface-container-lowest z-40 hidden md:flex flex-col justify-between p-space-md"><div class="space-y-space-lg"><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Discovery Rail</div><div class="space-y-space-2xs"><div class="px-space-sm py-space-xs bg-surface-container-low rounded text-on-surface font-body-sm text-body-sm flex items-center justify-between"><span class="font-code-sm text-code-sm text-primary">#hybrid-rerank</span><span class="font-label-sm text-label-sm text-on-surface-variant">v0.98</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#vector-dense</span><span class="font-label-sm text-label-sm text-on-surface-variant">qdrant</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#bm25-sparse</span><span class="font-label-sm text-label-sm text-on-surface-variant">local</span></div></div></div><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Autonomous Tasks</div><div class="space-y-space-2xs"><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Arxiv Vector Indexer</span><span class="font-label-sm text-label-sm text-primary">84%</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-primary-container w-[84%]"></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Security CVE Crawl</span><span class="font-label-sm text-label-sm text-secondary">RUNNING</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-secondary-container w-[42%]"></div></div></div></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>RAM UTILIZATION</span><span class="font-code-sm text-code-sm text-on-surface">6.2 / 32 GB</span></div><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>INDEX CACHE HIT</span><span class="font-code-sm text-code-sm text-primary">99.4%</span></div></div></aside><div class="md:pl-64"><main class="relative pt-24 min-h-screen bg-background w-full px-gutter-md py-space-lg"><div class="flex flex-col w-full space-y-space-xl">
+<!-- TOP CONTROL & RUNTIME CONTEXT BAR -->
+<div class="flex flex-col gap-space-md bg-surface-container-low p-space-md rounded-lg shadow-sm">
+<!-- Breadcrumb & Query Context -->
+<div class="flex flex-wrap items-center justify-between gap-space-md">
+<div class="flex items-center gap-space-sm min-w-0">
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-primary font-code-sm text-code-sm rounded uppercase tracking-wider font-semibold">QUERY EXEC</span>
+<div class="flex items-center gap-space-xs min-w-0">
+<span class="font-code-lg text-code-lg text-on-surface font-semibold truncate">high density rackmount homelab server epyc 2024</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">/ 4 Verticals Hydrated</span>
+</div>
+</div>
+<div class="flex items-center gap-space-xs shrink-0">
+<button class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs transition-colors" type="button">
+<span class="material-symbols-outlined text-xs text-primary">tune</span>
+<span>Rerank Params</span>
+</button>
+<button class="px-space-sm py-space-2xs bg-primary-container text-on-primary-container font-code-sm text-code-sm rounded font-semibold flex items-center gap-space-xs hover:brightness-105 transition-all" type="button">
+<span class="material-symbols-outlined text-xs">refresh</span>
+<span>Sync All</span>
+</button>
+</div>
+</div>
+<!-- Sub-navigation vertical tabs -->
+<div class="flex flex-wrap items-center justify-between gap-space-sm border-t border-surface-container-high pt-space-sm">
+<div class="flex flex-wrap items-center gap-space-xs">
+<button class="px-space-sm py-space-xs bg-surface-container-highest text-primary font-label-md text-label-md rounded flex items-center gap-space-xs shadow-sm">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+<span>ALL VERTICALS</span>
+<span class="text-on-surface-variant font-code-sm text-code-sm ml-1">[Σ 12]</span>
+</button>
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-label-md text-label-md rounded flex items-center gap-space-xs transition-colors">
+<span class="material-symbols-outlined text-xs">image</span>
+<span>IMAGES (MASONRY)</span>
+<span class="text-primary font-code-sm text-code-sm ml-1">4</span>
+</button>
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-label-md text-label-md rounded flex items-center gap-space-xs transition-colors">
+<span class="material-symbols-outlined text-xs">play_circle</span>
+<span>VIDEOS GRID</span>
+<span class="text-secondary font-code-sm text-code-sm ml-1">3</span>
+</button>
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-label-md text-label-md rounded flex items-center gap-space-xs transition-colors">
+<span class="material-symbols-outlined text-xs">feed</span>
+<span>NEWS FEED</span>
+<span class="text-tertiary-container font-code-sm text-code-sm ml-1">3</span>
+</button>
+<button class="px-space-sm py-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface-variant hover:text-on-surface font-label-md text-label-md rounded flex items-center gap-space-xs transition-colors">
+<span class="material-symbols-outlined text-xs">shopping_bag</span>
+<span>SHOPPING &amp; HARDWARE</span>
+<span class="text-primary-fixed font-code-sm text-code-sm ml-1">3</span>
+</button>
+</div>
+<!-- Tactical Privacy Guard Metrics -->
+<div class="flex items-center gap-space-sm px-space-sm py-space-2xs bg-surface-container-lowest rounded text-on-surface-variant">
+<div class="flex items-center gap-space-xs">
+<span class="w-1.5 h-1.5 rounded-full bg-primary-container animate-pulse"></span>
+<span class="font-label-sm text-label-sm uppercase tracking-wider text-on-surface">Proxied CDN: <span class="text-primary font-code-sm text-code-sm">ACTIVE</span></span>
+</div>
+<span class="text-outline-variant font-code-sm text-code-sm">•</span>
+<div class="flex items-center gap-space-xs">
+<span class="material-symbols-outlined text-xs text-secondary">shield</span>
+<span class="font-label-sm text-label-sm uppercase tracking-wider">Referrer Strip: <span class="text-secondary font-code-sm text-code-sm">ENABLED</span></span>
+</div>
+<span class="text-outline-variant font-code-sm text-code-sm">•</span>
+<div class="flex items-center gap-space-xs">
+<span class="font-label-sm text-label-sm uppercase tracking-wider">Trackers Blocked: <span class="text-primary font-code-sm text-code-sm font-semibold">142</span></span>
+</div>
+</div>
+</div>
+</div>
+<!-- SECTION 1: IMAGES MASONRY GRID (TECHNICAL ASSETS) -->
+<section class="flex flex-col space-y-space-md">
+<div class="flex items-center justify-between pb-space-xs border-b border-surface-container-high">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-primary text-base">photo_library</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight uppercase">Visual Schematics &amp; Chassis Architecture</h2>
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-primary font-code-sm text-code-sm rounded">4 ASSETS</span>
+</div>
+<div class="flex items-center gap-space-xs font-label-sm text-label-sm text-on-surface-variant uppercase">
+<span>INSPECT ON HOVER</span>
+<kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">SPACE</kbd>
+</div>
+</div>
+<!-- Masonry Grid with 4 bespoke cards -->
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-space-md">
+<!-- Card 1 -->
+<div class="group relative flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full h-48 bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" data-alt="High-resolution technical engineering photograph of a Supermicro H13 1U rackmount server motherboard with dual SP5 EPYC 9004 sockets, 24 DDR5 DIMM slots, teal anodized VRM heatsinks, and copper heatpipes under clean architectural studio lighting against a dark carbon background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBIw6eMdUm7YATT3zCrpBsTIjAKTuZ4Se2AaLKCBx1di8LfaoEVh5UjxiVYit-mLnslGnaGciLgWtszsnVnK2mgwDCPWffaC-tYvURX0zfDD3QbK3n8w9HGmSweMw3VPExfcsBjGhIxgfrcfIH_oq7X5bwX3CynF3d1IiASRxSf_uYEptSjoo0rw62qmwzBxq7X0yarlJRNu24JXhqfFn6V09kEv02KkrOVG8ySu4Sq"/>
+<div class="absolute top-2 left-2 flex items-center gap-space-2xs px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-label-sm text-label-sm text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+<span>LOCAL INDEX</span>
+</div>
+<div class="absolute top-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-code-sm text-code-sm text-secondary">
+            3840×2160
+          </div>
+<!-- Hover Inspect Overlay -->
+<div class="absolute inset-0 bg-surface-container-lowest/95 backdrop-blur-sm p-space-sm flex flex-col justify-between opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+<div class="space-y-space-xs">
+<div class="flex items-center justify-between border-b border-surface-container-high pb-space-2xs">
+<span class="font-label-sm text-label-sm text-primary uppercase font-semibold">METADATA INSPECT</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">PNG // 4.8 MB</span>
+</div>
+<p class="font-code-sm text-code-sm text-on-surface-variant leading-tight truncate">SHA: 8f4a210bc931...b72a</p>
+<div class="space-y-space-2xs font-code-sm text-code-sm text-on-surface">
+<div class="flex justify-between"><span class="text-on-surface-variant">Color Space:</span><span>sRGB IEC61966</span></div>
+<div class="flex justify-between"><span class="text-on-surface-variant">Crawl Proxy:</span><span class="text-primary">sgx-node-tor</span></div>
+</div>
+</div>
+<button class="w-full py-space-xs bg-primary text-on-primary font-code-sm text-code-sm font-semibold rounded flex items-center justify-center gap-space-xs hover:brightness-105" type="button">
+<span class="material-symbols-outlined text-xs">download</span>
+<span>DOWNLOAD VIA PROXY</span>
+</button>
+</div>
+</div>
+<div class="p-space-sm flex flex-col justify-between flex-1 gap-space-xs">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant truncate">servethehome.com</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium truncate mt-space-2xs">1U EPYC 9004 Supermicro Layout</h3>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant font-code-sm text-code-sm pt-space-xs border-t border-surface-container">
+<span class="text-primary font-medium">score: 0.984</span>
+<span>2.1 MB raw</span>
+</div>
+</div>
+</div>
+<!-- Card 2 -->
+<div class="group relative flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full h-48 bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" data-alt="CAD 3D isometric render of an industrial matte black PETG 10-inch mini-rack mount enclosure bracket designed for compact home homelab servers, displaying precise honeycomb airflow ventilation and anodized hex bolt fasteners on a deep blue terminal background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuCXSMosCUDuxpOhcmjPp06n0kSMpifs1E84_cufEjUv_jObIGCSPFW6TuRqz3cphPzwYS9AmCoVVhorHOkdx2v07bid4YHOPHM8esDQsr5j6dLJQEzS09xZZEUFcluoqFXJSxejUuD7tLVD0APDMnomRuvdZqiLnu-5gz-aSu4STKJriNk81K1nHYGV06LKBcNXpqtowOfWcXAHDOQUwxa2E_nBEcXwl8w6Yuxs8D00"/>
+<div class="absolute top-2 left-2 flex items-center gap-space-2xs px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-label-sm text-label-sm text-secondary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-secondary"></span>
+<span>WEBP CACHE</span>
+</div>
+<div class="absolute top-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-code-sm text-code-sm text-secondary">
+            1920×1080
+          </div>
+<!-- Hover Inspect Overlay -->
+<div class="absolute inset-0 bg-surface-container-lowest/95 backdrop-blur-sm p-space-sm flex flex-col justify-between opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+<div class="space-y-space-xs">
+<div class="flex items-center justify-between border-b border-surface-container-high pb-space-2xs">
+<span class="font-label-sm text-label-sm text-primary uppercase font-semibold">METADATA INSPECT</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">WEBP // 840 KB</span>
+</div>
+<p class="font-code-sm text-code-sm text-on-surface-variant leading-tight truncate">SHA: e3b0c44298fc...1c14</p>
+<div class="space-y-space-2xs font-code-sm text-code-sm text-on-surface">
+<div class="flex justify-between"><span class="text-on-surface-variant">License:</span><span>CC BY-NC-SA 4.0</span></div>
+<div class="flex justify-between"><span class="text-on-surface-variant">Mesh Form:</span><span class="text-secondary">Solid STL Included</span></div>
+</div>
+</div>
+<button class="w-full py-space-xs bg-primary text-on-primary font-code-sm text-code-sm font-semibold rounded flex items-center justify-center gap-space-xs hover:brightness-105" type="button">
+<span class="material-symbols-outlined text-xs">download</span>
+<span>DOWNLOAD VIA PROXY</span>
+</button>
+</div>
+</div>
+<div class="p-space-sm flex flex-col justify-between flex-1 gap-space-xs">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant truncate">printables.com</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium truncate mt-space-2xs">Custom 3D 10-inch Mini-Rack Mount</h3>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant font-code-sm text-code-sm pt-space-xs border-t border-surface-container">
+<span class="text-primary font-medium">score: 0.941</span>
+<span>840 KB raw</span>
+</div>
+</div>
+</div>
+<!-- Card 3 -->
+<div class="group relative flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full h-48 bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" data-alt="Scientific computational fluid dynamics (CFD) thermal velocity heatmap showing air turbulence through a 2U dense server chassis with four high-static pressure fans, cold intake vector lines in electric teal and cyan transforming into amber thermal exhaust." src="https://lh3.googleusercontent.com/aida-public/AB6AXuAT1xR9_Fmt9k3cvJiNp93kqkVFJ3piW3iIsAnlFgHuFjayaesGh6QF7shqNuqV5BvG3bhf_aHqcdznz0YTwrL_g3To3dRRHMpT9uMyFRU0xEAzKEPnC9-F7JG0S40OrV8k-_qISP0xgijCfcbTM1hlrj4avzZNfOutuZ7uOYiqlbjppXEFabMY8FviYTBDBvh4oQVi5DDGK_JlX99-tt50lyFRpWEolDPcJ34R2VwI"/>
+<div class="absolute top-2 left-2 flex items-center gap-space-2xs px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-label-sm text-label-sm text-tertiary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-tertiary-container"></span>
+<span>ARXIV DATA</span>
+</div>
+<div class="absolute top-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-code-sm text-code-sm text-secondary">
+            2560×1440
+          </div>
+<!-- Hover Inspect Overlay -->
+<div class="absolute inset-0 bg-surface-container-lowest/95 backdrop-blur-sm p-space-sm flex flex-col justify-between opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+<div class="space-y-space-xs">
+<div class="flex items-center justify-between border-b border-surface-container-high pb-space-2xs">
+<span class="font-label-sm text-label-sm text-primary uppercase font-semibold">METADATA INSPECT</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">SVG/PNG // 1.2 MB</span>
+</div>
+<p class="font-code-sm text-code-sm text-on-surface-variant leading-tight truncate">SHA: 34b1a82f09cc...7d01</p>
+<div class="space-y-space-2xs font-code-sm text-code-sm text-on-surface">
+<div class="flex justify-between"><span class="text-on-surface-variant">Paper ID:</span><span>arXiv:2401.09412</span></div>
+<div class="flex justify-between"><span class="text-on-surface-variant">Reynolds No:</span><span class="text-tertiary-container">Re = 4.2e4</span></div>
+</div>
+</div>
+<button class="w-full py-space-xs bg-primary text-on-primary font-code-sm text-code-sm font-semibold rounded flex items-center justify-center gap-space-xs hover:brightness-105" type="button">
+<span class="material-symbols-outlined text-xs">download</span>
+<span>DOWNLOAD VIA PROXY</span>
+</button>
+</div>
+</div>
+<div class="p-space-sm flex flex-col justify-between flex-1 gap-space-xs">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant truncate">arxiv.org</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium truncate mt-space-2xs">Thermal Airflow CFD Analysis 2U</h3>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant font-code-sm text-code-sm pt-space-xs border-t border-surface-container">
+<span class="text-primary font-medium">score: 0.912</span>
+<span>1.2 MB raw</span>
+</div>
+</div>
+</div>
+<!-- Card 4 -->
+<div class="group relative flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full h-48 bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" data-alt="High precision wireframe architectural blueprint schematic of OpenCompute Project 21-inch V3 Open Rack standard with busbar power distribution rail, module bay dimensions in luminous teal lines on a deep slate navy grid background." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDRAxrswEiasHvnM6FE7kKUpcKn7brzUcgcq5dDwJCQ36SrcAgHtKZP_9esPd5UUJ5R1x-LbQ2UcE-5QlqYmtU1Q6NYs2fczyvZ9BZEYGVunXO4RdM9c18KrCN3Romm0OrIiirK8rQJXPC7ZqRLPbclmIvh7M4UXtLlIEcOXd9ncNlzqY628Ht6MwkV-QMuKRH_8Ics7e73C7lSY1vpdxjxpatNpM0Svgu7IzpXYcym"/>
+<div class="absolute top-2 left-2 flex items-center gap-space-2xs px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-label-sm text-label-sm text-primary uppercase">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+<span>SPEC DRAFT</span>
+</div>
+<div class="absolute top-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 backdrop-blur rounded font-code-sm text-code-sm text-secondary">
+            4096×2048
+          </div>
+<!-- Hover Inspect Overlay -->
+<div class="absolute inset-0 bg-surface-container-lowest/95 backdrop-blur-sm p-space-sm flex flex-col justify-between opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+<div class="space-y-space-xs">
+<div class="flex items-center justify-between border-b border-surface-container-high pb-space-2xs">
+<span class="font-label-sm text-label-sm text-primary uppercase font-semibold">METADATA INSPECT</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">TIFF // 9.4 MB</span>
+</div>
+<p class="font-code-sm text-code-sm text-on-surface-variant leading-tight truncate">SHA: 77a11d9f82bc...4419</p>
+<div class="space-y-space-2xs font-code-sm text-code-sm text-on-surface">
+<div class="flex justify-between"><span class="text-on-surface-variant">Bus Voltage:</span><span>48V DC Native</span></div>
+<div class="flex justify-between"><span class="text-on-surface-variant">Spec Release:</span><span class="text-primary">OCP-ORv3-REV2</span></div>
+</div>
+</div>
+<button class="w-full py-space-xs bg-primary text-on-primary font-code-sm text-code-sm font-semibold rounded flex items-center justify-center gap-space-xs hover:brightness-105" type="button">
+<span class="material-symbols-outlined text-xs">download</span>
+<span>DOWNLOAD VIA PROXY</span>
+</button>
+</div>
+</div>
+<div class="p-space-sm flex flex-col justify-between flex-1 gap-space-xs">
+<div>
+<div class="font-label-sm text-label-sm text-on-surface-variant truncate">opencompute.org</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium truncate mt-space-2xs">OpenCompute 21-in V3 Rack Blueprint</h3>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant font-code-sm text-code-sm pt-space-xs border-t border-surface-container">
+<span class="text-primary font-medium">score: 0.967</span>
+<span>9.4 MB raw</span>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- SECTION 2: VIDEOS GRID (PRIVACY WRAPPED) -->
+<section class="flex flex-col space-y-space-md">
+<div class="flex items-center justify-between pb-space-xs border-b border-surface-container-high">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-secondary text-base">video_library</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight uppercase">Decentralized Video Feeds &amp; Teardowns</h2>
+<span class="px-space-xs py-space-2xs bg-surface-container-high text-secondary font-code-sm text-code-sm rounded">INVIDIOUS / PEERTUBE STREAM</span>
+</div>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">ZERO GOOGLE TELEMETRY</span>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-space-md">
+<!-- Video 1 -->
+<div class="flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full aspect-video bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover" data-alt="Server technician in an anti-static lab bench environment assembling a dual-socket AMD EPYC workstation motherboard with 128 cores, PCIe Gen 5 riser cables, and enterprise NVMe cages, illuminated with crisp cool teal lighting." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDNefsSMHGykBrNqvaQi1lPfjm5eueXK6pnAGn-kOUpwK4JTzgUGh1IMkijFPRwhRikNqzpMYT4l8F3T6VEfRCZFyiZHAHCv5k18hmWCeccfXNYn8R75cXDm3GPonuycIxDKNrBjjHzKRYzD7ysSKs7SUZOrbpX3DK88c7BSqr6eoF-3M6KZvdeIZHE7te6POwCLwFgR_Eb5GTwNdyehMNyi42-gr7bnKO4JdbSm3GI"/>
+<div class="absolute inset-0 bg-gradient-to-t from-surface-container-lowest/80 via-transparent to-transparent"></div>
+<div class="absolute bottom-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 font-kbd text-kbd text-on-surface rounded font-semibold">
+            24:18
+          </div>
+<div class="absolute top-2 left-2 px-space-xs py-space-2xs bg-primary/20 text-primary border border-primary/40 font-code-sm text-code-sm rounded">
+            4K HDR
+          </div>
+</div>
+<div class="p-space-md flex flex-col justify-between flex-1 gap-space-sm">
+<div>
+<div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant mb-space-xs">
+<span class="text-secondary font-semibold">Level1Techs</span>
+<span>Invidious Mirror #3</span>
+</div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-medium leading-snug">
+              Building a 128-Core AMD EPYC Homelab Cluster with Proxmox &amp; Ceph
+            </h3>
+</div>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span class="flex items-center gap-space-2xs">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+              28.4k views
+            </span>
+<a class="text-primary hover:underline flex items-center gap-space-2xs font-medium" href="#">
+<span>Stream Direct</span>
+<span class="material-symbols-outlined text-xs">launch</span>
+</a>
+</div>
+</div>
+</div>
+<!-- Video 2 -->
+<div class="flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full aspect-video bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover" data-alt="Technical presenter on stage at FOSDEM conference pointing at a terminal slide showing SQLite vector index benchmarks, IOPS throughput graphs, and embedded NVMe latency tables with audience silhouette." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDK2fll8kD2ia0lTEBAL8U6QCJyjgovOnwfJJPVJsWk9q7iXLRV5rnIiwLf6YrRffu1RbCXVAHrk5-5kEmSE1QVjOiNCwITQCdDYQjlib9TnOktUM11R7w9I4icJeJYVL_8kJ3-7ZLkBLZawPBRLgxphFfOZFQhvQT9gXlARPFeFLlDaTAnVLCQkjrtgr7suASN8Fr2fygKioy8EGp6l0jJqTDGHBxoL6XDcMr5rcHL"/>
+<div class="absolute inset-0 bg-gradient-to-t from-surface-container-lowest/80 via-transparent to-transparent"></div>
+<div class="absolute bottom-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 font-kbd text-kbd text-on-surface rounded font-semibold">
+            42:05
+          </div>
+<div class="absolute top-2 left-2 px-space-xs py-space-2xs bg-secondary/20 text-secondary border border-secondary/40 font-code-sm text-code-sm rounded">
+            1080p60
+          </div>
+</div>
+<div class="p-space-md flex flex-col justify-between flex-1 gap-space-sm">
+<div>
+<div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant mb-space-xs">
+<span class="text-secondary font-semibold">Fosdem 2024</span>
+<span>PeerTube federated</span>
+</div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-medium leading-snug">
+              SQLite at Scale: 1 Billion Vectors on a Single NVMe Node
+            </h3>
+</div>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span class="flex items-center gap-space-2xs">
+<span class="w-1.5 h-1.5 rounded-full bg-secondary"></span>
+              14.2k views
+            </span>
+<a class="text-secondary hover:underline flex items-center gap-space-2xs font-medium" href="#">
+<span>Stream Direct</span>
+<span class="material-symbols-outlined text-xs">launch</span>
+</a>
+</div>
+</div>
+</div>
+<!-- Video 3 -->
+<div class="flex flex-col bg-surface-container-low rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-all">
+<div class="relative w-full aspect-video bg-surface-container-lowest overflow-hidden">
+<img class="w-full h-full object-cover" data-alt="Sound level meter measuring decibels inside a residential apartment next to a customized 2U rackmount server enclosure featuring Noctua brown and beige quiet fans with custom acoustic foam dampening panels." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDA-I_SRmWHMuRHCXyYY-3hMGnD_A7YPOAo95U6P1a40VXkFDRgilagWTh5DSxJzf_s5neFToEBrUL-G1h07FAt7BHZ7ijq0YLrNOt6fgdq-ol_by0ZU2fZmYHqX8s5HDs8-5f5bd_GvA71rp3Club991Hp5hLjuN8y2Lumq6fkzJ8zYUfRVDYQUZJxPqNMMfrhyqp7QbdJZLxu7zas5Y6J2Ll52JtQxLW69Tkyyzln"/>
+<div class="absolute inset-0 bg-gradient-to-t from-surface-container-lowest/80 via-transparent to-transparent"></div>
+<div class="absolute bottom-2 right-2 px-space-xs py-space-2xs bg-surface-container-lowest/90 font-kbd text-kbd text-on-surface rounded font-semibold">
+            15:40
+          </div>
+<div class="absolute top-2 left-2 px-space-xs py-space-2xs bg-primary/20 text-primary border border-primary/40 font-code-sm text-code-sm rounded">
+            4K 60fps
+          </div>
+</div>
+<div class="p-space-md flex flex-col justify-between flex-1 gap-space-sm">
+<div>
+<div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant mb-space-xs">
+<span class="text-secondary font-semibold">Craft Computing</span>
+<span>Invidious Mirror #1</span>
+</div>
+<h3 class="font-headline-md text-headline-md text-on-surface font-medium leading-snug">
+              Silent 2U Rackmount Server in an Apartment: Soundproofing &amp; Fans
+            </h3>
+</div>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span class="flex items-center gap-space-2xs">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+              41.9k views
+            </span>
+<a class="text-primary hover:underline flex items-center gap-space-2xs font-medium" href="#">
+<span>Stream Direct</span>
+<span class="material-symbols-outlined text-xs">launch</span>
+</a>
+</div>
+</div>
+</div>
+</div>
+</section>
+<!-- SPLIT SECTION 3 & 4: NEWS FEED + HARDWARE SHOPPING -->
+<div class="grid grid-cols-1 lg:grid-cols-12 gap-space-lg">
+<!-- SECTION 3: NEWS FEED (CHRONOLOGICAL, ZERO-CLICKBAIT) - 6 COLS -->
+<div class="lg:col-span-6 flex flex-col space-y-space-md">
+<div class="flex items-center justify-between pb-space-xs border-b border-surface-container-high">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-tertiary-container text-base">rss_feed</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight uppercase">Chronological News Stream</h2>
+</div>
+<div class="flex items-center gap-space-xs font-label-sm text-label-sm text-on-surface-variant">
+<span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>
+<span>LIVE INGESTION</span>
+</div>
+</div>
+<div class="space-y-space-sm">
+<!-- News Item 1 -->
+<article class="p-space-md bg-surface-container-low hover:bg-surface-container rounded-lg transition-colors space-y-space-xs shadow-sm">
+<div class="flex items-center justify-between gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="font-code-sm text-code-sm text-primary font-semibold">12m ago</span>
+<span class="text-outline-variant font-code-sm text-code-sm">•</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">The Register</span>
+</div>
+<div class="flex items-center gap-space-xs px-space-xs py-space-2xs bg-surface-container-high rounded font-code-sm text-code-sm">
+<span class="text-on-surface-variant">Reputation:</span>
+<span class="text-primary font-semibold">94/100</span>
+</div>
+</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium hover:text-primary transition-colors cursor-pointer">
+            AMD Expands Embedded EPYC 8004 Series for Edge AI Deployments
+          </h3>
+<p class="font-body-sm text-body-sm text-on-surface-variant line-clamp-2">
+            Siena family processors optimized for lower thermal envelopes ranging from 70W to 225W, targeting telco installations and dense 1U multi-node edge micro-datacenters without water cooling requirements.
+          </p>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span>Tags: #epyc #embedded #edge-ai</span>
+<div class="flex items-center gap-space-sm">
+<button class="text-primary hover:underline flex items-center gap-space-2xs">
+<span class="material-symbols-outlined text-xs">article</span>
+<span>Read Clean Text</span>
+</button>
+</div>
+</div>
+</article>
+<!-- News Item 2 -->
+<article class="p-space-md bg-surface-container-low hover:bg-surface-container rounded-lg transition-colors space-y-space-xs shadow-sm">
+<div class="flex items-center justify-between gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="font-code-sm text-code-sm text-primary font-semibold">45m ago</span>
+<span class="text-outline-variant font-code-sm text-code-sm">•</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Phoronix</span>
+</div>
+<div class="flex items-center gap-space-xs px-space-xs py-space-2xs bg-surface-container-high rounded font-code-sm text-code-sm">
+<span class="text-on-surface-variant">Reputation:</span>
+<span class="text-primary font-semibold">98/100</span>
+</div>
+</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium hover:text-primary transition-colors cursor-pointer">
+            Linux 6.9 Kernel Optimization Brings 8% Speedup to SQLite FTS5
+          </h3>
+<p class="font-body-sm text-body-sm text-on-surface-variant line-clamp-2">
+            Synthetic filesystem microbenchmarks across ext4 and btrfs highlight asynchronous I/O batching enhancements directly benefiting SQLite full-text vector index scans on fast NVMe drives.
+          </p>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span>Tags: #kernel #sqlite #fts5</span>
+<div class="flex items-center gap-space-sm">
+<button class="text-secondary hover:underline flex items-center gap-space-2xs">
+<span class="material-symbols-outlined text-xs">history_edu</span>
+<span>Cached View</span>
+</button>
+</div>
+</div>
+</article>
+<!-- News Item 3 -->
+<article class="p-space-md bg-surface-container-low hover:bg-surface-container rounded-lg transition-colors space-y-space-xs shadow-sm">
+<div class="flex items-center justify-between gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="font-code-sm text-code-sm text-secondary font-semibold">2h ago</span>
+<span class="text-outline-variant font-code-sm text-code-sm">•</span>
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">HN / Systems Blog</span>
+</div>
+<div class="flex items-center gap-space-xs px-space-xs py-space-2xs bg-surface-container-high rounded font-code-sm text-code-sm">
+<span class="text-on-surface-variant">Reputation:</span>
+<span class="text-primary font-semibold">91/100</span>
+</div>
+</div>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-medium hover:text-primary transition-colors cursor-pointer">
+            Why We Ditched Elasticsearch for SQLite FTS in Production
+          </h3>
+<p class="font-body-sm text-body-sm text-on-surface-variant line-clamp-2">
+            Engineering post detailing memory footprint savings going from a 3-node JVM cluster eating 48GB of RAM down to a single read-replicated SQLite file using 400MB with lower p99 latency.
+          </p>
+<div class="flex items-center justify-between pt-space-xs border-t border-surface-container text-on-surface-variant font-code-sm text-code-sm">
+<span>342 comments • 618 points</span>
+<div class="flex items-center gap-space-sm">
+<button class="text-primary hover:underline flex items-center gap-space-2xs">
+<span class="material-symbols-outlined text-xs">chat</span>
+<span>HN Thread</span>
+</button>
+</div>
+</div>
+</article>
+</div>
+</div>
+<!-- SECTION 4: HARDWARE & SHOPPING (HONEST TRANSPARENCY) - 6 COLS -->
+<div class="lg:col-span-6 flex flex-col space-y-space-md">
+<div class="flex items-center justify-between pb-space-xs border-b border-surface-container-high">
+<div class="flex items-center gap-space-sm">
+<span class="material-symbols-outlined text-primary-fixed text-base">memory</span>
+<h2 class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight uppercase">Hardware Procurement &amp; Pricing</h2>
+</div>
+<div class="flex items-center gap-space-xs px-space-xs py-space-2xs bg-surface-container-high text-primary font-code-sm text-code-sm rounded">
+<span>0% AFFILIATE COMM</span>
+</div>
+</div>
+<!-- Honest Transparency Notice Card -->
+<div class="p-space-sm bg-surface-container-lowest rounded-lg border-l-2 border-primary flex items-start gap-space-sm">
+<span class="material-symbols-outlined text-primary text-sm mt-0.5">verified_user</span>
+<div class="space-y-space-2xs text-on-surface">
+<p class="font-label-sm text-label-sm uppercase font-semibold text-primary">Honest Disclosure Policy</p>
+<p class="font-body-sm text-body-sm text-on-surface-variant">
+            Zero tracking cookies or redirect monetization injects. If you purchase through external merchant links, IntentForge receives 0% commission unless explicitly self-configured via personal affiliate keys in <span class="font-code-sm text-code-sm text-on-surface">Node Settings</span>.
+          </p>
+</div>
+</div>
+<!-- Product List -->
+<div class="space-y-space-sm">
+<!-- Item 1 -->
+<div class="p-space-md bg-surface-container-low rounded-lg shadow-sm space-y-space-sm">
+<div class="flex items-start justify-between gap-space-md">
+<div class="space-y-space-2xs min-w-0">
+<span class="font-label-sm text-label-sm text-on-surface-variant uppercase">E-ATX // SP5 LGA6096 // PCIE 5.0</span>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-semibold leading-snug">
+                Supermicro H13SSL-N Single AMD EPYC 9004 Motherboard
+              </h3>
+<div class="flex items-center gap-space-sm font-code-sm text-code-sm text-on-surface-variant">
+<span>Merchant: <strong class="text-on-surface">Newegg Enterprise</strong></span>
+<span class="text-tertiary-container">★ 4.9 (148 reviews)</span>
+<span class="text-primary font-semibold">In Stock (3 units)</span>
+</div>
+</div>
+<div class="text-right shrink-0">
+<div class="font-display-lg text-headline-lg text-primary font-semibold tracking-tight">$789.00</div>
+<div class="font-code-sm text-code-sm text-primary flex items-center justify-end gap-space-2xs">
+<span class="material-symbols-outlined text-xs">trending_down</span>
+<span>-4.2% 30d</span>
+</div>
+</div>
+</div>
+<!-- Price Trend Sparkline SVG -->
+<div class="p-space-xs bg-surface-container-lowest rounded flex items-center justify-between gap-space-md">
+<div class="font-label-sm text-label-sm text-on-surface-variant">30-DAY INDEX:</div>
+<div class="flex-1 h-6">
+<svg class="w-full h-full text-primary" fill="none" preserveaspectratio="none" viewbox="0 0 200 24">
+<path d="M0,8 L40,10 L80,6 L120,12 L160,18 L200,20" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"></path>
+<circle cx="200" cy="20" fill="currentColor" r="2.5"></circle>
+</svg>
+</div>
+<a class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs transition-colors shrink-0" href="#">
+<span>Direct Link</span>
+<span class="material-symbols-outlined text-xs text-primary">arrow_outward</span>
+</a>
+</div>
+</div>
+<!-- Item 2 -->
+<div class="p-space-md bg-surface-container-low rounded-lg shadow-sm space-y-space-sm">
+<div class="flex items-start justify-between gap-space-md">
+<div class="space-y-space-2xs min-w-0">
+<span class="font-label-sm text-label-sm text-secondary uppercase">NVME GEN4 // U.2 15MM // 1 DWPD</span>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-semibold leading-snug">
+                Samsung PM9A3 3.84TB U.2 PCIe 4.0 NVMe Enterprise SSD
+              </h3>
+<div class="flex items-center gap-space-sm font-code-sm text-code-sm text-on-surface-variant">
+<span>Merchant: <strong class="text-on-surface">WiredZone</strong></span>
+<span class="text-secondary font-medium">Certified Refurbished</span>
+<span>100% Health Guarantee</span>
+</div>
+</div>
+<div class="text-right shrink-0">
+<div class="font-display-lg text-headline-lg text-on-surface font-semibold tracking-tight">$349.50</div>
+<div class="font-code-sm text-code-sm text-secondary flex items-center justify-end gap-space-2xs">
+<span class="material-symbols-outlined text-xs">horizontal_rule</span>
+<span>Stable past 60d</span>
+</div>
+</div>
+</div>
+<!-- Price Trend Sparkline SVG -->
+<div class="p-space-xs bg-surface-container-lowest rounded flex items-center justify-between gap-space-md">
+<div class="font-label-sm text-label-sm text-on-surface-variant">60-DAY INDEX:</div>
+<div class="flex-1 h-6">
+<svg class="w-full h-full text-secondary" fill="none" preserveaspectratio="none" viewbox="0 0 200 24">
+<path d="M0,12 L50,12 L100,10 L150,14 L200,12" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"></path>
+<circle cx="200" cy="12" fill="currentColor" r="2.5"></circle>
+</svg>
+</div>
+<a class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs transition-colors shrink-0" href="#">
+<span>Direct Link</span>
+<span class="material-symbols-outlined text-xs text-secondary">arrow_outward</span>
+</a>
+</div>
+</div>
+<!-- Item 3 -->
+<div class="p-space-md bg-surface-container-low rounded-lg shadow-sm space-y-space-sm">
+<div class="flex items-start justify-between gap-space-md">
+<div class="space-y-space-2xs min-w-0">
+<span class="font-label-sm text-label-sm text-tertiary-container uppercase">COOLING // SOCKET SP5 &amp; TR5 // 24.6 DB(A)</span>
+<h3 class="font-headline-sm text-headline-sm text-on-surface font-semibold leading-snug">
+                Noctua NH-U14S TR5-SP6 Silent CPU Cooler for SP5/TR5
+              </h3>
+<div class="flex items-center gap-space-sm font-code-sm text-code-sm text-on-surface-variant">
+<span>Merchant: <strong class="text-on-surface">QuietPC (Direct)</strong></span>
+<span class="text-primary font-medium">Fast Dispatch</span>
+<span>Ships within 24h</span>
+</div>
+</div>
+<div class="text-right shrink-0">
+<div class="font-display-lg text-headline-lg text-on-surface font-semibold tracking-tight">$129.90</div>
+<div class="font-code-sm text-code-sm text-on-surface-variant flex items-center justify-end gap-space-2xs">
+<span>MSRP Matched</span>
+</div>
+</div>
+</div>
+<!-- Price Trend Sparkline SVG -->
+<div class="p-space-xs bg-surface-container-lowest rounded flex items-center justify-between gap-space-md">
+<div class="font-label-sm text-label-sm text-on-surface-variant">30-DAY INDEX:</div>
+<div class="flex-1 h-6">
+<svg class="w-full h-full text-on-surface-variant" fill="none" preserveaspectratio="none" viewbox="0 0 200 24">
+<path d="M0,14 L60,14 L110,14 L160,14 L200,14" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"></path>
+<circle cx="200" cy="14" fill="currentColor" r="2.5"></circle>
+</svg>
+</div>
+<a class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs transition-colors shrink-0" href="#">
+<span>Direct Link</span>
+<span class="material-symbols-outlined text-xs text-primary">arrow_outward</span>
+</a>
+</div>
+</div>
+</div>
+</div>
+</div>
+<!-- PERSISTENT FOOTER METRIC TERMINAL RAIL -->
+<footer class="p-space-sm bg-surface-container-lowest rounded-lg flex flex-wrap items-center justify-between gap-space-md text-on-surface-variant font-code-sm text-code-sm">
+<div class="flex items-center gap-space-md">
+<span class="flex items-center gap-space-xs">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+<span>INDEX STATE: SYNCHRONIZED</span>
+</span>
+<span>•</span>
+<span>PAYLOAD SIZE: 18.2 MB (COMPRESSED TO 4.1 MB)</span>
+<span>•</span>
+<span>PROVENANCE: MULTI-AGENT SCRAPE</span>
+</div>
+<div class="flex items-center gap-space-sm">
+<span class="text-primary font-semibold">IntentForge Proxied Gateway</span>
+<span class="px-space-xs py-space-2xs bg-surface-container rounded text-on-surface">AES-GCM-256</span>
+</div>
+</footer>
+</div></main></div></body></html>

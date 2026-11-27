@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head><meta charset="utf-8"/><meta content="width=device-width, initial-scale=1.0" name="viewport"/><meta content="web_dashboard" name="shell-type"/><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet"/><link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/><style>@layer base{html,body{margin:0;padding:0;}body{overscroll-behavior:none;}main>:first-child{margin-top:0!important;}main>:last-child{margin-bottom:0!important;}}::-webkit-scrollbar{display:none;}</style><script src="https://cdn.tailwindcss.com"></script><script id="tailwind-config">tailwind.config={darkMode:"class",theme:{extend:{colors:{"surface-container":"#1c2028","error":"#ffb4ab","on-error":"#690005","on-primary":"#00382a","surface-tint":"#00e0af","surface-container-low":"#181c24","secondary-fixed-dim":"#7bd0ff","error-container":"#93000a","surface-container-high":"#262a33","outline-variant":"#3b4a43","primary-fixed-dim":"#00e0af","surface-variant":"#31353e","on-tertiary":"#472a00","surface":"#0f131c","on-primary-container":"#00614a","on-tertiary-fixed":"#2a1700","on-primary-fixed-variant":"#00513d","tertiary-container":"#ffbe6d","on-secondary-container":"#00374d","on-secondary":"#00354a","inverse-surface":"#dfe2ee","on-tertiary-container":"#784b00","on-surface":"#dfe2ee","background":"#0f131c","on-primary-fixed":"#002117","tertiary-fixed":"#ffddb8","tertiary-fixed-dim":"#ffb95f","on-secondary-fixed":"#001e2c","inverse-primary":"#006c53","surface-container-lowest":"#0a0e16","secondary-container":"#00a6e0","on-surface-variant":"#bacac2","primary-container":"#00e5b3","outline":"#84948c","tertiary":"#ffe2c3","surface-dim":"#0f131c","on-tertiary-fixed-variant":"#653e00","on-error-container":"#ffdad6","surface-container-highest":"#31353e","on-secondary-fixed-variant":"#004c69","secondary-fixed":"#c4e7ff","inverse-on-surface":"#2c3039","primary-fixed":"#42feca","secondary":"#7bd0ff","primary":"#6fffd1","surface-bright":"#353942","on-background":"#dfe2ee"},borderRadius:{"DEFAULT":"0.125rem","lg":"0.25rem","xl":"0.5rem","full":"0.75rem"},spacing:{"margin":"1rem","gutter":"0.75rem","space-2xl":"2rem","space-xs":"0.25rem","space-xl":"1.5rem","space-md":"0.75rem","space-sm":"0.5rem","space-2xs":"0.125rem","margin-md":"1.5rem","gutter-md":"1rem","space-lg":"1rem"},fontFamily:{"label-md":["JetBrains Mono"],"display-lg":["Inter"],"code-md":["JetBrains Mono"],"body-lg":["Inter"],"kbd":["JetBrains Mono"],"headline-lg-mobile":["Inter"],"headline-sm":["Inter"],"code-sm":["JetBrains Mono"],"code-lg":["JetBrains Mono"],"label-sm":["JetBrains Mono"],"headline-lg":["Inter"],"body-md":["Inter"],"body-sm":["Inter"],"headline-md":["Inter"]},fontSize:{"label-md":["11px",{"lineHeight":"14px","letterSpacing":"0.06em","fontWeight":"600"}],"display-lg":["30px",{"lineHeight":"38px","letterSpacing":"-0.025em","fontWeight":"600"}],"code-md":["12px",{"lineHeight":"18px","letterSpacing":"-0.01em","fontWeight":"400"}],"body-lg":["14px",{"lineHeight":"22px","letterSpacing":"0em","fontWeight":"400"}],"kbd":["10px",{"lineHeight":"10px","letterSpacing":"0.02em","fontWeight":"600"}],"headline-lg-mobile":["18px",{"lineHeight":"24px","letterSpacing":"-0.015em","fontWeight":"600"}],"headline-sm":["14px",{"lineHeight":"20px","letterSpacing":"-0.005em","fontWeight":"600"}],"code-sm":["11px",{"lineHeight":"15px","letterSpacing":"0em","fontWeight":"400"}],"code-lg":["13px",{"lineHeight":"20px","letterSpacing":"-0.01em","fontWeight":"500"}],"label-sm":["10px",{"lineHeight":"12px","letterSpacing":"0.08em","fontWeight":"500"}],"headline-lg":["22px",{"lineHeight":"28px","letterSpacing":"-0.02em","fontWeight":"600"}],"body-md":["13px",{"lineHeight":"19px","letterSpacing":"0em","fontWeight":"400"}],"body-sm":["12px",{"lineHeight":"16px","letterSpacing":"0.01em","fontWeight":"400"}],"headline-md":["16px",{"lineHeight":"22px","letterSpacing":"-0.01em","fontWeight":"600"}]}}}};</script></head><body class="bg-background font-body-md text-on-surface antialiased selection:bg-primary-container selection:text-on-primary-container"><header class="fixed top-0 inset-x-0 z-50 bg-surface-container-lowest"><div class="h-14 w-full px-gutter-md flex items-center justify-between gap-space-md"><div class="flex items-center gap-space-md min-w-0"><div class="flex items-center gap-space-sm shrink-0"><span class="w-2 h-2 rounded-full bg-primary-container animate-pulse"></span><span class="font-headline-sm text-headline-sm text-on-surface font-semibold tracking-tight">IntentForge <span class="text-primary font-code-md text-code-md font-medium">v2</span></span></div><div class="hidden xl:flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">SELF-HOSTED // node-01-sgx // 14ms latency</span></div></div><div class="flex-1 max-w-xl mx-space-md hidden md:block"><div class="w-full flex items-center justify-between px-space-md py-space-xs bg-surface-container-low rounded"><div class="flex items-center gap-space-sm min-w-0"><span class="font-code-md text-code-md text-primary font-medium shrink-0">&gt;_</span><span class="font-code-md text-code-md text-on-surface-variant truncate">scope:hybrid intent:crawl --live</span></div><div class="flex items-center gap-space-xs shrink-0"><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">/</kbd><kbd class="font-kbd text-kbd px-space-xs py-space-2xs bg-surface-container-high text-on-surface-variant rounded">⌘K</kbd></div></div></div><div class="flex items-center gap-space-md shrink-0"><div class="hidden lg:flex items-center gap-space-sm"><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-primary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Vector Sync: <span class="text-on-surface font-code-sm text-code-sm">4.2M docs</span></span></div><div class="flex items-center gap-space-xs px-space-sm py-space-2xs bg-surface-container-low rounded"><span class="w-1.5 h-1.5 rounded-full bg-secondary"></span><span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Tunnel: <span class="text-secondary font-code-sm text-code-sm">ACTIVE</span></span></div></div><div class="flex items-center gap-space-sm"><button class="px-space-sm py-space-2xs bg-surface-container-high hover:bg-surface-variant text-on-surface rounded font-code-sm text-code-sm flex items-center gap-space-xs" type="button"><span class="material-symbols-outlined text-sm text-primary">terminal</span><span class="hidden sm:inline">DEV</span></button><img alt="Profile" class="w-8 h-8 rounded-full object-cover" src="https://lh3.googleusercontent.com/aida/ALJJyrAfkFzl8qQWjIuA1o8YDioW6crvCUXIcVbnhpB8o23rl9Mr6L0r5TVsg7hwd-OHqLU_dsGv_jMHnClm46hgEeS5gD_ed39I7lOB56J6zDz-nJ8mu1Ox7MNTBM6HnmOVINJFLWOC7f8dhDcNUAaZQrmRba13qMfei8CsBh78jnQ1L4bdaGOT9PmCwrnwMFRb4Hc9BU2cbqZXm_BASYNkrJSfS2HSBVz__oke29nXGKGu"/></div></div></div><div class="w-full px-gutter-md bg-surface-container-low"><div class="flex items-center justify-between overflow-x-auto"><nav class="flex items-center gap-space-xs py-space-2xs" data-active-classes="text-primary font-semibold bg-surface-container"><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="search-and-inspect" href="#">Search &amp; Inspect</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="media-and-verticals" href="#">Media &amp; Verticals</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="goals-engine" href="#">Goals Engine</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="developer-api" href="#">Developer API</a><a class="px-space-md py-space-xs rounded font-label-md text-label-md uppercase tracking-wider text-on-surface-variant hover:text-on-surface transition-colors whitespace-nowrap" data-path="node-settings" href="#">Node Settings</a></nav><div class="hidden sm:flex items-center gap-space-sm py-space-2xs text-on-surface-variant"><span class="font-code-sm text-code-sm">SYS_OK</span><span class="font-code-sm text-code-sm text-outline-variant">|</span><span class="font-code-sm text-code-sm">ENC:AES-256</span></div></div></div></header><aside class="fixed left-0 top-24 bottom-0 w-64 bg-surface-container-lowest z-40 hidden md:flex flex-col justify-between p-space-md"><div class="space-y-space-lg"><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Discovery Rail</div><div class="space-y-space-2xs"><div class="px-space-sm py-space-xs bg-surface-container-low rounded text-on-surface font-body-sm text-body-sm flex items-center justify-between"><span class="font-code-sm text-code-sm text-primary">#hybrid-rerank</span><span class="font-label-sm text-label-sm text-on-surface-variant">v0.98</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#vector-dense</span><span class="font-label-sm text-label-sm text-on-surface-variant">qdrant</span></div><div class="px-space-sm py-space-xs rounded text-on-surface-variant font-body-sm text-body-sm flex items-center justify-between hover:bg-surface-container-low hover:text-on-surface"><span class="font-code-sm text-code-sm">#bm25-sparse</span><span class="font-label-sm text-label-sm text-on-surface-variant">local</span></div></div></div><div class="space-y-space-xs"><div class="px-space-sm font-label-sm text-label-sm text-on-surface-variant uppercase tracking-wider">Autonomous Tasks</div><div class="space-y-space-2xs"><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Arxiv Vector Indexer</span><span class="font-label-sm text-label-sm text-primary">84%</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-primary-container w-[84%]"></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between"><span class="font-code-sm text-code-sm text-on-surface font-medium truncate">Security CVE Crawl</span><span class="font-label-sm text-label-sm text-secondary">RUNNING</span></div><div class="w-full h-1 bg-surface-container-high rounded-full overflow-hidden"><div class="h-full bg-secondary-container w-[42%]"></div></div></div></div></div></div><div class="p-space-sm bg-surface-container-low rounded space-y-space-2xs"><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>RAM UTILIZATION</span><span class="font-code-sm text-code-sm text-on-surface">6.2 / 32 GB</span></div><div class="flex items-center justify-between font-label-sm text-label-sm text-on-surface-variant"><span>INDEX CACHE HIT</span><span class="font-code-sm text-code-sm text-primary">99.4%</span></div></div></aside><div class="md:pl-64"><main class="relative pt-24 min-h-screen bg-background w-full px-gutter-md py-space-lg"><div class="flex flex-col w-full">
+<!-- Interactive & Density Header Deck -->
+<div class="w-full flex flex-col gap-space-sm mb-space-lg">
+<!-- Active Query Terminal Bar -->
+<div class="w-full bg-surface-container-low rounded p-space-sm flex flex-col md:flex-row items-start md:items-center justify-between gap-space-sm">
+<div class="flex items-center gap-space-sm flex-1 min-w-0 w-full">
+<span class="font-code-md text-code-md text-primary font-bold select-none shrink-0">&gt;_</span>
+<div class="flex items-center gap-space-xs font-code-md text-code-md truncate w-full">
+<span class="text-on-surface font-medium">sqlite vss vector search</span>
+<span class="text-tertiary-fixed-dim">after:2024</span>
+<span class="text-secondary-fixed-dim">site:github.com</span>
+<span class="text-on-surface-variant">OR</span>
+<span class="text-secondary-fixed-dim">site:arxiv.org</span>
+<span class="text-primary-container">filetype:md</span>
+<span class="text-error">NOT:draft</span>
+</div>
+</div>
+<div class="flex items-center gap-space-sm shrink-0 self-end md:self-auto">
+<span class="font-code-sm text-code-sm text-primary bg-surface-container px-space-xs py-space-2xs rounded">AST_VAL: VALID</span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">0.018s lat</span>
+<button class="px-space-sm py-space-2xs bg-primary text-on-primary font-code-sm text-code-sm font-semibold rounded hover:opacity-90 active:scale-95 transition-all" type="button">
+          EXECUTE
+        </button>
+</div>
+</div>
+<!-- Active Parsed Operators & Granular Fast Facets -->
+<div class="flex flex-wrap items-center justify-between gap-space-sm bg-surface-container-lowest p-space-sm rounded">
+<div class="flex flex-wrap items-center gap-space-xs">
+<span class="font-label-sm text-label-sm uppercase text-on-surface-variant mr-space-xs tracking-wider">FILTERS:</span>
+<!-- Active Tag 1: Github -->
+<div class="flex items-center gap-space-xs bg-surface-container px-space-sm py-space-2xs rounded text-primary-container font-code-sm text-code-sm group cursor-pointer hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-xs">domain</span>
+<span>site:github.com</span>
+<span class="material-symbols-outlined text-xs text-on-surface-variant group-hover:text-error transition-colors">close</span>
+</div>
+<!-- Active Tag 2: Filetype -->
+<div class="flex items-center gap-space-xs bg-surface-container px-space-sm py-space-2xs rounded text-primary-container font-code-sm text-code-sm group cursor-pointer hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-xs">description</span>
+<span>filetype:md</span>
+<span class="material-symbols-outlined text-xs text-on-surface-variant group-hover:text-error transition-colors">close</span>
+</div>
+<!-- Active Tag 3: NOT:draft -->
+<div class="flex items-center gap-space-xs bg-error-container text-on-error-container px-space-sm py-space-2xs rounded font-code-sm text-code-sm group cursor-pointer hover:opacity-90 transition-opacity">
+<span class="material-symbols-outlined text-xs">block</span>
+<span class="font-medium">NOT:draft</span>
+<span class="material-symbols-outlined text-xs group-hover:text-error transition-colors">close</span>
+</div>
+<!-- Active Tag 4: Temporal -->
+<div class="flex items-center gap-space-xs bg-surface-container px-space-sm py-space-2xs rounded text-tertiary-fixed-dim font-code-sm text-code-sm group cursor-pointer hover:bg-surface-container-high transition-colors">
+<span class="material-symbols-outlined text-xs">calendar_month</span>
+<span>after:2024</span>
+<span class="material-symbols-outlined text-xs text-on-surface-variant group-hover:text-error transition-colors">close</span>
+</div>
+<!-- Inactive Hint -->
+<div class="flex items-center gap-space-xs bg-surface-container-low px-space-sm py-space-2xs rounded text-outline font-code-sm text-code-sm hover:text-on-surface hover:bg-surface-container cursor-pointer transition-colors">
+<span class="text-outline-variant">+</span>
+<span>price:</span>
+</div>
+</div>
+<!-- Quick Context Controls -->
+<div class="flex flex-wrap items-center gap-space-sm text-on-surface-variant font-code-sm text-code-sm">
+<div class="flex items-center gap-space-xs bg-surface-container-low px-space-sm py-space-2xs rounded">
+<span class="text-outline">TIME:</span>
+<button class="text-on-surface-variant hover:text-on-surface">24h</button>
+<span class="text-outline-variant">/</span>
+<button class="text-on-surface-variant hover:text-on-surface">1w</button>
+<span class="text-outline-variant">/</span>
+<span class="text-primary font-semibold">1y (active)</span>
+</div>
+<div class="flex items-center gap-space-xs bg-surface-container-low px-space-sm py-space-2xs rounded">
+<span class="text-outline">SOURCES:</span>
+<span class="text-primary font-semibold">LOCAL: 1.4k</span>
+<span class="text-outline-variant">|</span>
+<span class="text-secondary font-semibold">WEB: 82.1k</span>
+</div>
+<div class="flex items-center gap-space-xs bg-surface-container-low px-space-sm py-space-2xs rounded">
+<span class="text-outline">SORT:</span>
+<span class="text-on-surface">RELEVANCE (0.942)</span>
+</div>
+</div>
+</div>
+</div>
+<!-- Dual Stream Two-Column Layout -->
+<div class="grid grid-cols-1 lg:grid-cols-12 gap-space-lg items-start">
+<!-- LEFT COLUMN: Results Stream (~64% width -> 8 cols of 12) -->
+<div class="lg:col-span-8 flex flex-col gap-space-md min-w-0">
+<!-- Meta Telemetry Header -->
+<div class="bg-surface-container-low px-space-md py-space-sm rounded flex items-center justify-between font-code-sm text-code-sm text-on-surface-variant">
+<div class="flex items-center gap-space-xs flex-wrap">
+<span class="text-on-surface font-semibold">94 results</span>
+<span class="text-outline-variant">•</span>
+<span class="text-primary font-medium">0.018s execution</span>
+<span class="text-outline-variant">•</span>
+<span>31 local SQLite FTS5+VSS</span>
+<span class="text-outline-variant">•</span>
+<span>63 Privacy Proxy</span>
+</div>
+<span class="hidden sm:inline bg-surface-container px-space-xs py-space-2xs rounded text-primary font-code-sm text-code-sm">Rank ≥ 0.720</span>
+</div>
+<!-- Result Card 1 (Local Vector Indexed) -->
+<article class="bg-surface-container-low hover:bg-surface-container transition-all duration-150 p-space-md rounded flex flex-col gap-space-sm">
+<div class="flex items-center justify-between flex-wrap gap-space-xs">
+<div class="flex items-center gap-space-xs">
+<span class="bg-primary/10 text-primary px-space-xs py-space-2xs rounded font-label-sm text-label-sm uppercase flex items-center gap-1 font-semibold">
+<span class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></span>
+              LOCAL CLUSTER INDEX
+            </span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">github.com/asg017/sqlite-vss</span>
+</div>
+<span class="font-code-sm text-code-sm text-secondary bg-surface-container px-space-xs py-space-2xs rounded font-medium">
+            VECTOR DIST: 0.142 (sim: 0.988)
+          </span>
+</div>
+<div>
+<h2 class="font-headline-md text-headline-md text-on-surface hover:text-primary transition-colors cursor-pointer font-semibold">
+            sqlite-vss: An extension for SQLite to bring Vector Search to SQLite based on Faiss
+          </h2>
+<div class="flex items-center gap-space-sm text-on-surface-variant font-code-sm text-code-sm mt-space-2xs flex-wrap">
+<span class="text-primary underline">https://github.com/asg017/sqlite-vss</span>
+<span>•</span>
+<span>Updated 3 days ago</span>
+<span>•</span>
+<span class="text-on-surface">License: MIT</span>
+<span>•</span>
+<span class="text-tertiary font-medium">★ 4.8k</span>
+</div>
+</div>
+<p class="font-body-md text-body-md text-on-surface-variant leading-relaxed">
+          A SQLite extension that brings <mark class="bg-primary-container/20 text-primary-container px-1 py-0.5 rounded font-medium">vector search</mark> to SQLite, based on Faiss. Supports vss0 virtual tables, exact and approximate nearest neighbor search via <mark class="bg-primary-container/20 text-primary-container px-1 py-0.5 rounded font-medium">sqlite vss vector search</mark>. Fully self-contained C-extension with zero runtime cloud requirements.
+        </p>
+<!-- Matched Tokens Breakdown -->
+<div class="bg-surface-container-lowest p-space-xs rounded flex items-center justify-between flex-wrap gap-space-xs font-code-sm text-code-sm">
+<div class="flex items-center gap-space-xs">
+<span class="text-outline uppercase text-[10px]">MATCHED:</span>
+<span class="text-primary">site:github.com</span>
+<span class="text-outline-variant">/</span>
+<span class="text-primary">filetype:md</span>
+<span class="text-outline-variant">/</span>
+<span class="text-tertiary-fixed-dim">date:2024-03</span>
+</div>
+<div class="flex items-center gap-space-xs">
+<span class="text-outline uppercase text-[10px]">SHARD:</span>
+<span class="text-on-surface">sgx-node-01::fs_chunk_9401</span>
+</div>
+</div>
+<!-- Card Action Dock -->
+<div class="flex items-center justify-between pt-space-xs flex-wrap gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-primary">code</span>
+<span>Open Raw Source</span>
+</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-secondary">add_task</span>
+<span>Add to Goals Roadmap</span>
+</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-tertiary">account_tree</span>
+<span>Inspect AST</span>
+</button>
+</div>
+<button class="px-space-xs py-space-2xs text-on-surface-variant hover:text-on-surface font-code-sm text-code-sm flex items-center gap-1" type="button">
+<kbd class="font-kbd text-kbd bg-surface-container-high px-1 rounded text-primary">C</kbd>
+<span>Copy cURL</span>
+</button>
+</div>
+</article>
+<!-- Result Card 2 (Federated Remote Arxiv Vector) -->
+<article class="bg-surface-container-low hover:bg-surface-container transition-all duration-150 p-space-md rounded flex flex-col gap-space-sm">
+<div class="flex items-center justify-between flex-wrap gap-space-xs">
+<div class="flex items-center gap-space-xs">
+<span class="bg-secondary/10 text-secondary px-space-xs py-space-2xs rounded font-label-sm text-label-sm uppercase font-semibold">
+              FEDERATED WEB INDEX
+            </span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">arxiv.org/abs/2402.19482</span>
+</div>
+<span class="font-code-sm text-code-sm text-secondary bg-surface-container px-space-xs py-space-2xs rounded font-medium">
+            VECTOR DIST: 0.179 (sim: 0.964)
+          </span>
+</div>
+<div>
+<h2 class="font-headline-md text-headline-md text-on-surface hover:text-secondary transition-colors cursor-pointer font-semibold">
+            Vector Embeddings in SQLite: Scaling to Millions of Records with Faiss Indexes
+          </h2>
+<div class="flex items-center gap-space-sm text-on-surface-variant font-code-sm text-code-sm mt-space-2xs flex-wrap">
+<span class="text-secondary underline">https://arxiv.org/abs/2402.19482</span>
+<span>•</span>
+<span class="text-on-surface">Published Feb 2024</span>
+<span>•</span>
+<span class="bg-surface-container-high px-1 rounded text-tertiary-fixed-dim uppercase text-[10px]">PDF</span>
+<span>•</span>
+<span>18 Citations</span>
+</div>
+</div>
+<p class="font-body-md text-body-md text-on-surface-variant leading-relaxed">
+          Benchmarking embedded search latencies across 10M dense vectors within single-node SQLite environments. Explores memory mapped storage, quantization, and hybrid lexical/vector queries utilizing local FTS5 indexing along with zero-copy SIMD arithmetic.
+        </p>
+<!-- Metric Badges Row -->
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-space-xs">
+<div class="bg-surface-container-lowest p-space-xs rounded flex flex-col">
+<span class="font-label-sm text-label-sm text-outline">P95 LATENCY</span>
+<span class="font-code-sm text-code-sm text-primary font-semibold">4.2ms / 10k batch</span>
+</div>
+<div class="bg-surface-container-lowest p-space-xs rounded flex flex-col">
+<span class="font-label-sm text-label-sm text-outline">RECALL@10</span>
+<span class="font-code-sm text-code-sm text-secondary font-semibold">98.4% quantized</span>
+</div>
+<div class="bg-surface-container-lowest p-space-xs rounded flex flex-col">
+<span class="font-label-sm text-label-sm text-outline">BASE EMBEDDING</span>
+<span class="font-code-sm text-code-sm text-on-surface font-semibold truncate">text-embedding-3-small</span>
+</div>
+</div>
+<!-- Card Action Dock -->
+<div class="flex items-center justify-between pt-space-xs flex-wrap gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-secondary">download</span>
+<span>Fetch Paper Markdown</span>
+</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-secondary">share</span>
+<span>Vector Cross-Ref</span>
+</button>
+</div>
+<button class="px-space-xs py-space-2xs text-on-surface-variant hover:text-on-surface font-code-sm text-code-sm flex items-center gap-1" type="button">
+<kbd class="font-kbd text-kbd bg-surface-container-high px-1 rounded text-primary">Y</kbd>
+<span>Copy BibTeX</span>
+</button>
+</div>
+</article>
+<!-- Result Card 3 (Local Cluster Node Discovery) -->
+<article class="bg-surface-container-low hover:bg-surface-container transition-all duration-150 p-space-md rounded flex flex-col gap-space-sm">
+<div class="flex items-center justify-between flex-wrap gap-space-xs">
+<div class="flex items-center gap-space-xs">
+<span class="bg-primary/10 text-primary px-space-xs py-space-2xs rounded font-label-sm text-label-sm uppercase flex items-center gap-1 font-semibold">
+<span class="w-1.5 h-1.5 rounded-full bg-primary"></span>
+              LOCAL CLUSTER INDEX
+            </span>
+<span class="font-code-sm text-code-sm text-on-surface-variant">simonwillison.net</span>
+</div>
+<span class="font-code-sm text-code-sm text-secondary bg-surface-container px-space-xs py-space-2xs rounded font-medium">
+            VECTOR DIST: 0.221 (sim: 0.941)
+          </span>
+</div>
+<div>
+<h2 class="font-headline-md text-headline-md text-on-surface hover:text-primary transition-colors cursor-pointer font-semibold">
+            Designing Local-First Semantic Search Engines without External Daemons
+          </h2>
+<div class="flex items-center gap-space-sm text-on-surface-variant font-code-sm text-code-sm mt-space-2xs flex-wrap">
+<span class="text-primary underline">https://simonwillison.net/2024/Jan/sqlite-vss-notes/</span>
+<span>•</span>
+<span>Jan 28, 2024</span>
+<span>•</span>
+<span class="text-on-surface">Article Notes</span>
+</div>
+</div>
+<p class="font-body-md text-body-md text-on-surface-variant leading-relaxed">
+          How to bundle standalone search without Elastic or Pinecone. Uses SQLite virtual tables with zero telemetry, shipping completely embedded binaries with in-process vector dot product operations over AVX2 hardware.
+        </p>
+<!-- Inline Quick Snippet Code Preview -->
+<div class="bg-surface-container-lowest p-space-sm rounded font-code-sm text-code-sm text-on-surface overflow-x-auto">
+<span class="text-outline">1</span> <span class="text-secondary">create virtual table</span> vss_docs <span class="text-secondary">using</span> vss0(body_vector(1536));<br/>
+<span class="text-outline">2</span> <span class="text-secondary">select</span> rowid, distance <span class="text-secondary">from</span> vss_docs <span class="text-secondary">where</span> vss_search(body_vector, vss_params(?)) <span class="text-secondary">limit</span> 20;
+        </div>
+<!-- Card Action Dock -->
+<div class="flex items-center justify-between pt-space-xs flex-wrap gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-primary">visibility</span>
+<span>Inspect Vector Raw</span>
+</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-variant text-on-surface font-code-sm text-code-sm rounded flex items-center gap-1" type="button">
+<span class="material-symbols-outlined text-xs text-primary">open_in_new</span>
+<span>Open Local Mirror</span>
+</button>
+</div>
+<span class="font-code-sm text-code-sm text-outline-variant">SHA256: 7f8a...bc12</span>
+</div>
+</article>
+<!-- Precision Pagination Deck -->
+<div class="bg-surface-container-lowest p-space-md rounded flex flex-col md:flex-row items-center justify-between gap-space-md font-code-sm text-code-sm text-on-surface-variant mt-space-sm">
+<div class="flex items-center gap-space-xs">
+<span>Showing <strong class="text-on-surface">1 - 10</strong> of <strong class="text-on-surface">94</strong> results</span>
+<span class="text-outline-variant">|</span>
+<span>Window size: 10</span>
+</div>
+<div class="flex items-center gap-space-xs">
+<button class="px-space-sm py-space-2xs bg-primary text-on-primary font-bold rounded" type="button">1</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-container-high text-on-surface rounded" type="button">2</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-container-high text-on-surface rounded" type="button">3</button>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-container-high text-on-surface rounded" type="button">4</button>
+<span class="px-space-xs text-outline">...</span>
+<button class="px-space-sm py-space-2xs bg-surface-container hover:bg-surface-container-high text-on-surface rounded" type="button">10</button>
+</div>
+<div class="flex items-center gap-space-sm">
+<div class="flex items-center gap-space-xs">
+<span class="text-outline uppercase text-[10px]">EXPORT:</span>
+<button class="px-space-xs py-space-2xs bg-surface-container hover:bg-surface-container-high text-primary rounded font-semibold" type="button">[JSON]</button>
+<button class="px-space-xs py-space-2xs bg-surface-container hover:bg-surface-container-high text-primary rounded font-semibold" type="button">[CSV]</button>
+</div>
+</div>
+</div>
+</div>
+<!-- RIGHT COLUMN: Reasoning Inspector Panel (~36% width -> 4 cols of 12, Sticky Technical Drawer) -->
+<div class="lg:col-span-4 flex flex-col gap-space-md min-w-0 sticky top-24">
+<div class="bg-surface-container-low rounded p-space-md flex flex-col gap-space-md">
+<!-- Inspector Title Bar -->
+<div class="flex items-center justify-between pb-space-xs border-b border-surface-container-highest">
+<div class="flex items-center gap-space-xs min-w-0">
+<span class="material-symbols-outlined text-sm text-primary">terminal</span>
+<span class="font-code-sm text-code-sm text-on-surface font-semibold truncate">/inspect trace: query_ast_882f0c</span>
+</div>
+<span class="font-label-sm text-label-sm text-primary uppercase bg-primary/10 px-1 py-0.5 rounded shrink-0">LIVE SYNC</span>
+</div>
+<!-- Inspector Tabs -->
+<div class="grid grid-cols-4 gap-space-2xs bg-surface-container-lowest p-space-2xs rounded text-center font-label-sm text-label-sm">
+<button class="bg-surface-container text-primary font-semibold py-space-2xs rounded" type="button">SEMANTICS</button>
+<button class="text-on-surface-variant hover:text-on-surface py-space-2xs rounded" type="button">CONSTRAINTS</button>
+<button class="text-on-surface-variant hover:text-on-surface py-space-2xs rounded" type="button">EXEC PLAN</button>
+<button class="text-on-surface-variant hover:text-on-surface py-space-2xs rounded" type="button">JSON</button>
+</div>
+<!-- Classification & Confidence Breakdown -->
+<div class="bg-surface-container-lowest p-space-sm rounded space-y-space-xs">
+<div class="flex items-center justify-between">
+<span class="font-label-sm text-label-sm uppercase text-outline">PRIMARY INTENT</span>
+<span class="font-code-sm text-code-sm text-primary font-semibold">TECHNICAL_EVALUATION</span>
+</div>
+<div class="w-full bg-surface-container-high h-1.5 rounded-full overflow-hidden">
+<div class="bg-primary h-full w-[98.4%]"></div>
+</div>
+<div class="flex items-center justify-between font-code-sm text-code-sm text-on-surface-variant">
+<span>Confidence Index</span>
+<span class="text-on-surface font-mono">0.984</span>
+</div>
+<div class="pt-space-xs flex items-center justify-between">
+<span class="font-label-sm text-label-sm uppercase text-outline">SECONDARY INTENT</span>
+<span class="font-code-sm text-code-sm text-secondary font-semibold">CODE_IMPLEMENTATION</span>
+</div>
+<div class="w-full bg-surface-container-high h-1.5 rounded-full overflow-hidden">
+<div class="bg-secondary h-full w-[89.1%]"></div>
+</div>
+<div class="flex items-center justify-between font-code-sm text-code-sm text-on-surface-variant">
+<span>Confidence Index</span>
+<span class="text-on-surface font-mono">0.891</span>
+</div>
+</div>
+<!-- Normalization Engine -->
+<div class="bg-surface-container-lowest p-space-sm rounded space-y-space-xs font-code-sm text-code-sm">
+<div class="font-label-sm text-label-sm uppercase text-outline">QUERY NORMALIZATION</div>
+<div class="text-on-surface-variant">
+            Raw Input: <span class="text-on-surface">'sqlite vss vector search'</span>
+</div>
+<div class="text-on-surface-variant">
+            Normalized: <span class="text-primary font-medium">'sqlite-vss vector search'</span>
+</div>
+<div class="flex items-center justify-between pt-space-2xs text-[10px] text-outline">
+<span>LEVENSHTEIN DIST: 0</span>
+<span>TOKENS: 4 LEX / 3 SYNTAX</span>
+</div>
+</div>
+<!-- Extracted Constraints Block -->
+<div class="bg-surface-container-lowest p-space-sm rounded space-y-space-xs font-code-sm text-code-sm">
+<div class="font-label-sm text-label-sm uppercase text-outline">STRUCTURED CONSTRAINTS</div>
+<div class="flex items-start gap-space-xs">
+<span class="text-tertiary-fixed-dim shrink-0">TEMPORAL:</span>
+<span class="text-on-surface break-all">created_at &gt;= 2024-01-01T00:00:00Z</span>
+</div>
+<div class="flex items-start gap-space-xs">
+<span class="text-secondary shrink-0">DOMAINS:</span>
+<span class="text-on-surface break-all">['github.com', 'arxiv.org']</span>
+</div>
+<div class="flex items-start gap-space-xs">
+<span class="text-error shrink-0">EXCLUDE:</span>
+<span class="text-on-surface break-all">NOT IN ['draft', 'wip', 'unstable']</span>
+</div>
+<div class="flex items-start gap-space-xs">
+<span class="text-primary shrink-0">MIME_TYPE:</span>
+<span class="text-on-surface">text/markdown</span>
+</div>
+</div>
+<!-- Identity & Geolocation Routing (Privacy Clean) -->
+<div class="bg-surface-container-lowest p-space-sm rounded space-y-space-xs font-code-sm text-code-sm">
+<div class="flex items-center justify-between">
+<span class="font-label-sm text-label-sm uppercase text-outline">NODE &amp; PRIVACY ROUTING</span>
+<span class="text-primary text-[10px] font-bold">SCRUBBED</span>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant">
+<span>Active Worker:</span>
+<span class="text-on-surface font-medium">self-hosted-fra-01</span>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant">
+<span>Geo Intent Mode:</span>
+<span class="text-on-surface">GLOBAL_AGNOSTIC</span>
+</div>
+<div class="flex items-center justify-between text-on-surface-variant">
+<span>Client Fingerprint:</span>
+<span class="text-outline">NULL (0-byte sent)</span>
+</div>
+</div>
+<!-- Quality & Spam Signals -->
+<div class="bg-surface-container-lowest p-space-sm rounded font-code-sm text-code-sm space-y-space-2xs">
+<div class="font-label-sm text-label-sm uppercase text-outline">QUALITY SIGNALS</div>
+<div class="flex items-center justify-between">
+<span class="text-on-surface-variant">Spam Classifier Score:</span>
+<span class="text-primary font-bold">0.01 (Pristine)</span>
+</div>
+<div class="flex items-center justify-between">
+<span class="text-on-surface-variant">Mean Domain Authority:</span>
+<span class="text-secondary font-bold">94 / 100</span>
+</div>
+<div class="flex items-center justify-between">
+<span class="text-on-surface-variant">Ad &amp; Affiliate Trackers:</span>
+<span class="text-primary font-bold">0 Active (19 stripped)</span>
+</div>
+</div>
+<!-- Execution Plan Timing Breakdown -->
+<div class="bg-surface-container-lowest p-space-sm rounded space-y-space-xs font-code-sm text-code-sm">
+<div class="flex items-center justify-between font-label-sm text-label-sm uppercase text-outline">
+<span>TIMING EXECUTION BREAKDOWN</span>
+<span class="text-on-surface">18.0ms total</span>
+</div>
+<div class="space-y-1">
+<div class="flex items-center justify-between text-[11px]">
+<span class="text-on-surface-variant">AST Tokenizer</span>
+<span class="text-on-surface font-mono">1.1ms</span>
+</div>
+<div class="w-full bg-surface-container h-1 rounded-full overflow-hidden">
+<div class="bg-outline h-full w-[6%]"></div>
+</div>
+<div class="flex items-center justify-between text-[11px]">
+<span class="text-on-surface-variant">Faiss/VSS Vector Probe</span>
+<span class="text-secondary font-mono">6.4ms</span>
+</div>
+<div class="w-full bg-surface-container h-1 rounded-full overflow-hidden">
+<div class="bg-secondary h-full w-[35%]"></div>
+</div>
+<div class="flex items-center justify-between text-[11px]">
+<span class="text-on-surface-variant">FTS5 Lexical Merge</span>
+<span class="text-on-surface font-mono">4.2ms</span>
+</div>
+<div class="w-full bg-surface-container h-1 rounded-full overflow-hidden">
+<div class="bg-outline h-full w-[23%]"></div>
+</div>
+<div class="flex items-center justify-between text-[11px]">
+<span class="text-on-surface-variant">Cross-Encoder Re-rank</span>
+<span class="text-primary font-mono">6.3ms</span>
+</div>
+<div class="w-full bg-surface-container h-1 rounded-full overflow-hidden">
+<div class="bg-primary h-full w-[36%]"></div>
+</div>
+</div>
+</div>
+<!-- Raw Inspector Action Trigger -->
+<button class="w-full py-space-xs bg-surface-container hover:bg-surface-container-high text-on-surface font-code-sm text-code-sm rounded flex items-center justify-center gap-space-xs transition-colors" type="button">
+<span class="material-symbols-outlined text-sm text-primary">data_object</span>
+<span>Copy Complete Execution AST (.json)</span>
+</button>
+</div>
+</div>
+</div>
+</div></main></div></body></html>
