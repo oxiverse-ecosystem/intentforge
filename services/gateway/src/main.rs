@@ -110,6 +110,18 @@ fn indexer_url() -> String {
 fn crawler_url() -> String {
     std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string())
 }
+fn invidious_base_url(configured: Option<&str>) -> String {
+    match configured {
+        Some(value) if !value.trim().is_empty() => {
+            value.trim().trim_end_matches('/').to_string()
+        }
+        _ => "http://127.0.0.1:3000".to_string(),
+    }
+}
+fn invidious_url() -> String {
+    let configured = std::env::var("INVIDIOUS_URL").ok();
+    invidious_base_url(configured.as_deref())
+}
 
 
 fn deserialize_null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -132,6 +144,10 @@ struct SearchParams {
     offset: Option<usize>,
     #[serde(default)]
     ip: Option<String>,
+    /// If supplied, page from a previously returned ranked snapshot instead of
+    /// re-running the upstream fan-out. Falls back to a fresh search on miss.
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 /// Validate the non-string query parameters before axum's extractor runs.
@@ -193,27 +209,11 @@ where
     }
 }
 
-/// Build the documented `400 invalid_parameter` body: the `UnifiedResponse`
-/// envelope with neutral fields, matching `empty_query` / `invalid_query`.
+/// Build the documented `400 invalid_parameter` body via the same envelope
+/// builder as every other validation error, so key sets never drift.
 fn parameter_error(message: &str) -> axum::response::Response {
-    (
-        axum::http::StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "query": "",
-            "intent": null,
-            "category": null,
-            "confidence": null,
-            "constraints": [],
-            "structured_constraints": serde_json::to_value(Constraints::default())
-                .unwrap_or(serde_json::json!({})),
-            "expanded_queries": [],
-            "distribution": null,
-            "results": [],
-            "error": "invalid_parameter",
-            "message": message,
-        })),
-    )
-        .into_response()
+    let (status, body) = make_error_response("", "invalid_parameter", message, false);
+    (status, body).into_response()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -734,6 +734,107 @@ struct VideoResult {
     score: f32
 }
 
+/// Maximum number of Invidious rows allowed to enter /videos. Prevents the
+/// self-hosted instance from flooding the page with YouTube results.
+const MAX_INVIDIOUS_VIDEO_RESULTS: usize = 5;
+
+/// Normalize YouTube URLs to a video ID so the same video returned by SearXNG
+/// and Invidious is only shown once.
+fn video_id_from_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+    if host == "youtu.be" {
+        let id = parsed.path().trim_start_matches('/').split('/').next().unwrap_or("");
+        return if id.is_empty() { None } else { Some(id.to_string()) };
+    }
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        for (k, v) in parsed.query_pairs() {
+            if k == "v" && !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+        let parts: Vec<&str> = parsed.path().split('/').filter(|s| !s.is_empty()).collect();
+        if matches!(parts.first(), Some(&"embed" | &"shorts" | &"v")) && parts.len() > 1 {
+            return Some(parts[1].to_string());
+        }
+    }
+    None
+}
+
+/// Convert an Invidious search row into a VideoResult with a relevance-derived
+/// score comparable to SearXNG's, instead of the old constant 0.5 that could
+/// never enter a page once SearXNG supplied `limit` results.
+fn invidious_video_result(r: &InvidiousResult, q: &str) -> Option<VideoResult> {
+    if r.result_type.as_deref() != Some("video") {
+        return None;
+    }
+    let vid = r.video_id.clone()?;
+    if vid.trim().is_empty() {
+        return None;
+    }
+    let title = r.title.clone().unwrap_or_default();
+    if title.trim().is_empty() {
+        return None;
+    }
+    let description = r.description.clone().unwrap_or_default();
+    // Stopwords inflate coverage without adding topical signal.
+    let stopwords = ["the", "and", "for", "with", "how", "what", "best", "your",
+                     "from", "into", "that", "this", "why", "does", "can", "you", "are"];
+    let terms: Vec<&str> = q.split_whitespace()
+        .filter(|w| w.chars().count() > 2 && !stopwords.contains(&w.to_lowercase().as_str()))
+        .collect();
+    let haystack = format!("{} {}", title.to_lowercase(), description.to_lowercase());
+    let hits = terms.iter().filter(|t| haystack.contains(&t.to_lowercase())).count();
+    let coverage = if terms.is_empty() { 0.0 } else { hits as f32 / terms.len() as f32 };
+    // Strong coverage can reach the top of SearXNG's band; weak matches stay
+    // below typical web rows instead of occupying the first five slots.
+    let score = (0.55 + 0.40 * coverage).min(0.95);
+    Some(VideoResult {
+        title,
+        url: format!("https://www.youtube.com/watch?v={}", vid),
+        description,
+        thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
+        video_id: vid,
+        source: "invidious".to_string(),
+        score,
+    })
+}
+
+/// Merge the three providers: dedupe by URL and normalized video ID, admit at
+/// most MAX_INVIDIOUS_VIDEO_RESULTS Invidious rows, then order by score so a
+/// relevant Invidious video can actually appear in the truncated page.
+fn merge_video_results(
+    searx: Vec<VideoResult>,
+    searx2: Vec<VideoResult>,
+    invidious: Vec<VideoResult>,
+) -> Vec<VideoResult> {
+    let mut out: Vec<VideoResult> = Vec::new();
+    let mut seen_url = std::collections::HashSet::new();
+    let mut seen_id = std::collections::HashSet::new();
+    for r in searx.into_iter().chain(searx2) {
+        let id = if r.video_id.is_empty() { video_id_from_url(&r.url) } else { Some(r.video_id.clone()) };
+        if seen_url.contains(&r.url) || id.as_ref().map(|v| seen_id.contains(v)).unwrap_or(false) {
+            continue;
+        }
+        seen_url.insert(r.url.clone());
+        if let Some(v) = id { seen_id.insert(v); }
+        out.push(r);
+    }
+    let mut inv: Vec<VideoResult> = invidious.into_iter()
+        .filter(|r| !seen_url.contains(&r.url) && !seen_id.contains(&r.video_id))
+        .take(MAX_INVIDIOUS_VIDEO_RESULTS)
+        .collect();
+    sort_results_by(&mut inv, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
+    for r in inv {
+        if seen_url.contains(&r.url) || seen_id.contains(&r.video_id) { continue; }
+        seen_url.insert(r.url.clone());
+        seen_id.insert(r.video_id.clone());
+        out.push(r);
+    }
+    sort_results_by(&mut out, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
+    out
+}
+
 #[derive(Serialize)]
 struct NewsResult {
     title: String,
@@ -829,7 +930,7 @@ struct DeepResult {
     confidence: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct UnifiedResponse {
     query: String,
     intent: Option<String>,
@@ -912,6 +1013,10 @@ struct UnifiedResponse {
     /// Decoration is strictly post-ranking — proven by the order-invariance test.
     #[serde(skip_serializing_if = "Option::is_none")]
     shopping: Option<serde_json::Value>,
+    /// Opaque token identifying the immutable ranked list this page came from.
+    /// Pass it back as `snapshot_id` for stable, non-overlapping pages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_id: Option<String>,
 }
 
 const DOWNLOAD_KEYWORDS: &[&str] = &[
@@ -3015,6 +3120,10 @@ fn sanitize_constraints(c: &Constraints) -> Constraints {
             if !val.is_empty() && !related.contains(&val) {
                 related.push(val);
             }
+        } else if let Some(val) = clean_p.strip_prefix("price_min:") {
+            if let Ok(v) = val.trim().trim_matches(',').parse::<f32>() { price_min = Some(v); }
+        } else if let Some(val) = clean_p.strip_prefix("price_max:") {
+            if let Ok(v) = val.trim().trim_matches(',').parse::<f32>() { price_max = Some(v); }
         } else if clean_p.starts_with("price:") {
             let val = clean_p.strip_prefix("price:").unwrap().trim().to_string();
             if let Some(p) = parse_price_range(&val) {
@@ -6225,32 +6334,93 @@ fn extract_nl_price_bound(q: &str) -> Option<(f32, String)> {
     None
 }
 
+/// Identity for a ranked-result snapshot. Includes geo and operator context so
+/// a token from one query/geo can never be reused for another.
+fn snapshot_id_for(query: &str, geo: &str, operators: &str, now_ms: u128) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    (query, geo, operators).hash(&mut hasher);
+    format!("{:x}-{:x}", hasher.finish(), now_ms)
+}
+
+/// Slice an immutable ranked list. `total` and `has_more` always describe the
+/// whole snapshot, not the page, so consecutive pages cannot drift.
+fn paginate_snapshot<T: Clone>(items: &[T], offset: usize, limit: usize) -> (Vec<T>, usize, bool) {
+    let total = items.len();
+    let page = items.iter().skip(offset).take(limit).cloned().collect();
+    (page, total, offset + limit < total)
+}
+
+/// Score-descending sort with a URL tie-break: without it, equal-score rows
+/// keep whichever order the raced upstream engines happened to return, so
+/// consecutive pages (each its own fan-out) contain overlapping URLs.
+fn sort_results_by<T, F>(items: &mut Vec<T>, mut cmp: F)
+where F: FnMut(&T, &T) -> std::cmp::Ordering {
+    items.sort_by(&mut cmp);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FiletypeEvidence { Match, Mismatch, Unknown }
+
+/// Structural evidence for a `filetype:` constraint. Explicit mismatches are
+/// safe to drop; extensionless links are Unknown, never silently trusted.
+fn filetype_evidence(file_types: &[String], url: &str, _title: &str, _content: &str) -> FiletypeEvidence {
+    if file_types.is_empty() {
+        return FiletypeEvidence::Unknown;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return FiletypeEvidence::Mismatch;
+    };
+    let ext = std::path::Path::new(parsed.path())
+        .extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    if !ext.is_empty() {
+        return if file_types.iter().any(|ft| ft.to_lowercase() == ext) {
+            FiletypeEvidence::Match
+        } else {
+            FiletypeEvidence::Mismatch
+        };
+    }
+    // Signed CDN / viewer links often carry the real filename in a parameter.
+    let u = url.to_lowercase();
+    let hit = file_types.iter().any(|ft| {
+        let f = ft.to_lowercase();
+        ["file=", "filename=", "download=", "doc=", "path=", "url=", "response-content-disposition="]
+            .iter().any(|key| u.contains(&format!("{}{}", key, f)))
+            || u.contains(&format!(".{}", f))
+    });
+    if hit { FiletypeEvidence::Match } else { FiletypeEvidence::Unknown }
+}
+
+/// Keep only items carrying positive filetype evidence; if none match, fail
+/// open so a non-empty result set can never collapse to zero (same policy as
+/// inurl:/intext:).
+fn apply_filetype_policy<T: Clone>(
+    items: Vec<T>,
+    file_types: &[String],
+    evidence: impl Fn(&T) -> FiletypeEvidence,
+) -> (Vec<T>, bool) {
+    if file_types.is_empty() {
+        return (items, false);
+    }
+    let matches: Vec<T> = items.iter().filter(|i| evidence(i) == FiletypeEvidence::Match).cloned().collect();
+    if !matches.is_empty() {
+        (matches, false)
+    } else {
+        (items, true)
+    }
+}
+
 fn should_filter_by_constraints(
     title: &str, content: &str, url: &str, published_date: Option<&str>, constraints: &Constraints,
 ) -> bool {
-    // 1. Hard filter on file_types
+    // 1. Hard filter on file_types. Explicit mismatches are dropped; extensionless
+    // links are Unknown and kept here — the post-merge policy only keeps them
+    // when at least one other result carries real matching evidence.
     if !constraints.file_types.is_empty() {
-        if let Ok(parsed_url) = reqwest::Url::parse(url) {
-            let path = parsed_url.path();
-            let ext = std::path::Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_lowercase())
-                .unwrap_or_default();
-            if ext.is_empty() {
-                // The URL has no file extension at all (clean slug, CDN download
-                // link, Google Docs viewer, etc.). SearXNG already applied the
-                // `filetype:` constraint upstream, so we trust that and KEEP the
-                // result rather than hard-dropping it. Only when the URL *does*
-                // carry an extension do we require it to match — that's a
-                // reliable signal we can enforce without false negatives.
-                // (Previously every extensionless filetype result was dropped,
-                // which zeroed out `python filetype:pdf filetype:doc`.)
-            } else if !constraints.file_types.iter().any(|ft| ft.to_lowercase() == ext) {
-                return true;
-            }
-        } else {
-            return true;
+        match filetype_evidence(&constraints.file_types, url, title, content) {
+            FiletypeEvidence::Mismatch => return true,
+            FiletypeEvidence::Match | FiletypeEvidence::Unknown => {}
         }
     }
 
@@ -9521,7 +9691,8 @@ fn preprocess_searxng_query(query: &str) -> String {
     for w in q.split_whitespace() {
         let wl = w.to_lowercase();
         if wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
-            || wl.starts_with("price:") || wl.starts_with("lang:")
+            || wl.starts_with("price:") || wl.starts_with("price_min:") || wl.starts_with("price_max:")
+            || wl.starts_with("lang:")
             || wl.starts_with("after:") || wl.starts_with("before:")
         {
             // Emit native operators (everything except price:, after:, before: which
@@ -12841,7 +13012,7 @@ fn merge_local_and_web(
     }
 
     // 4. Sort by score descending
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
 
     // 4b. Position-aware domain diversity: penalize repeated domains in top slots.
     // The global cap (MAX_PER_DOMAIN=3) prevents outright flooding, but doesn't
@@ -12866,7 +13037,7 @@ fn merge_local_and_web(
             }
         }
         // Re-sort after diversity penalty
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // 4b-ii. OFF-TOPIC DOMAIN SATURATION GUARD (D-C: a single unrelated brand
@@ -12920,7 +13091,7 @@ fn merge_local_and_web(
                 }
             }
         }
-        merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // 4c. Source-level diversity boost: boost results from underrepresented engine sources.
@@ -13315,7 +13486,7 @@ fn merge_local_and_web(
 
     // Re-sort by score descending after post-calibration caps to ensure capped
     // results (video/dict/weak-match) move below higher-scoring text results.
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sort_results_by(&mut merged, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
 
     merged
 }
@@ -13621,6 +13792,14 @@ struct AppState {
 /// Apply the optional `limit` to a `{results, count, query}` media response.
 /// The cache stores the full result set, so truncation happens on read and a
 /// cached response can still serve a different page size.
+/// Default page size for `/videos` — 20 gives a useful result set while the
+/// explicit `limit` parameter still wins. Other media endpoints keep "all".
+const VIDEOS_DEFAULT_LIMIT: usize = 20;
+
+fn effective_media_limit(explicit: Option<usize>, default: usize) -> Option<usize> {
+    Some(explicit.unwrap_or(default))
+}
+
 fn apply_media_limit(mut value: serde_json::Value, limit: Option<usize>) -> serde_json::Value {
     let Some(limit) = limit else { return value };
     if let Some(arr) = value.get_mut("results").and_then(|v| v.as_array_mut()) {
@@ -13829,7 +14008,9 @@ async fn handle_videos(
     );
     if let Some(cached) = state.cache.get(&cache_key) {
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
-        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, params.limit)));
+        // Cached body is the full merged set; apply the same default page size
+        // on cache hits as on cold responses.
+        return (axum::http::StatusCode::OK, Json(apply_media_limit(value, effective_media_limit(params.limit, VIDEOS_DEFAULT_LIMIT))));
     }
 
     // Resolve client geolocation for location-aware video search
@@ -13857,7 +14038,7 @@ async fn handle_videos(
     let lang = constraints.language.as_deref();
 
     // Query Invidious and both SearXNG instances (categories=videos) in parallel
-    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
+    let invidious_url = format!("{}/api/v1/search?q={}", invidious_url(), urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
         &searxng_url(), &q, "videos", geo_location.as_ref(), lang
     );
@@ -13951,21 +14132,7 @@ async fn handle_videos(
         match tokio::time::timeout(Duration::from_secs(15), state.http_client.get(&invidious_url).send()).await {
             Ok(Ok(resp)) => match read_json_bounded::<Vec<InvidiousResult>>(resp).await {
                 Some(data) => data.into_iter()
-                    .filter(|r| r.result_type.as_deref() == Some("video"))
-                    .filter_map(|r| {
-                        let vid = r.video_id?;
-                        let title = r.title.unwrap_or_default();
-                        let description = r.description.unwrap_or_default();
-                        Some(VideoResult {
-                            title,
-                            url: format!("https://www.youtube.com/watch?v={}", vid),
-                            description,
-                            thumbnail: format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", vid),
-                            video_id: vid,
-                            source: "invidious".to_string(),
-                            score: 0.5,
-                        })
-                    })
+                    .filter_map(|r| invidious_video_result(&r, &q))
                     .collect::<Vec<_>>(),
                 None => { tracing::warn!("Invidious parse error / exceeded cap"); vec![] }
             },
@@ -13986,21 +14153,9 @@ async fn handle_videos(
     };
     let (searx_results, searx2_results, invidious_results) = tokio::join!(searx_fut, searx2_fut, invidious_deadline);
 
-    // Merge results: SearXNG first, then SearXNG2, then Invidious
-    let mut results = searx_results;
-    {
-        let mut seen: std::collections::HashSet<String> = results.iter().map(|r| r.url.clone()).collect();
-        for r in searx2_results {
-            if seen.insert(r.url.clone()) {
-                results.push(r);
-            }
-        }
-        for r in invidious_results {
-            if seen.insert(r.url.clone()) {
-                results.push(r);
-            }
-        }
-    }
+    // Merge providers: dedupe by URL/videoId, admit bounded Invidious rows,
+    // and order by score so the page is not simply "SearXNG first, rest unseen".
+    let results = merge_video_results(searx_results, searx2_results, invidious_results);
 
     let mut response = serde_json::json!({
         "results": results,
@@ -14013,7 +14168,7 @@ async fn handle_videos(
         state.cache.put(cache_key, response_json, Duration::from_secs(300));
     }
 
-    (axum::http::StatusCode::OK, Json(apply_media_limit(response, params.limit)))
+    (axum::http::StatusCode::OK, Json(apply_media_limit(response, effective_media_limit(params.limit, VIDEOS_DEFAULT_LIMIT))))
 }
 
 async fn handle_news(
@@ -14443,7 +14598,10 @@ async fn main() {
                 .with_state(state.clone())
                 .route_layer(middleware::from_fn(auth_middleware)),
         )
-        .with_state(state).layer(TimeoutLayer::new(Duration::from_secs(30)));
+        .fallback(json_not_found)
+        .with_state(state)
+        .layer(middleware::from_fn(normalize_framework_errors))
+        .layer(TimeoutLayer::new(Duration::from_secs(30)));
 
     // Bind port is env-configurable (default 4000) so a second, side-by-side
     // instance can be started — e.g. an affiliate-keys-ABSENT twin used to prove
@@ -15468,6 +15626,57 @@ async fn fetch_text_budgeted(
     }
 }
 
+/// Operator tokens that change the meaning of a search and therefore must be
+/// part of the cache identity. `clean_query_for_spelling` deliberately drops
+/// them before spell correction; dropping them from the key too made
+/// `/search?q=foo` and `/search?q=site:example.org foo` share one cached body.
+const CACHE_IDENTITY_OPERATORS: [&str; 12] = [
+    "site:", "filetype:", "after:", "before:", "lang:", "intitle:",
+    "inurl:", "intext:", "related:", "price:", "price_min:", "price_max:",
+];
+
+/// Stable, order-insensitive fingerprint of the structural operators in the
+/// ORIGINAL query. Pure so it can be unit-tested without a running gateway.
+fn search_cache_operator_key(raw_query: &str) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut in_quote = false;
+    let mut phrase = String::new();
+    let mut unquoted = String::new();
+    for ch in raw_query.chars() {
+        if matches!(ch, '"' | '“' | '”' | '‘' | '’') {
+            if in_quote {
+                tokens.push(format!("q:{}", phrase.trim().to_lowercase()));
+                phrase.clear();
+            }
+            in_quote = !in_quote;
+        } else if in_quote {
+            phrase.push(ch);
+        } else {
+            unquoted.push(ch);
+        }
+    }
+    for word in unquoted.split_whitespace() {
+        let w = word.trim_matches(',').to_lowercase();
+        if w.starts_with('-') || CACHE_IDENTITY_OPERATORS.iter().any(|op| w.starts_with(op)) {
+            tokens.push(w);
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    if tokens.is_empty() { "-".to_string() } else { tokens.join("|") }
+}
+
+/// Full /search cache identity: typo-normalized text + operator fingerprint +
+/// pagination + geo. The `search:` namespace prevents aliasing with the media
+/// endpoints' cache keys (e.g. `images:{q}:{geo}`).
+fn search_cache_key(corrected_clean: &str, raw_query: &str, page_key: &str, geo_key: &str) -> String {
+    format!("search:{}:{}:{}:{}",
+        corrected_clean.to_lowercase(),
+        search_cache_operator_key(raw_query),
+        page_key,
+        geo_key)
+}
+
 fn clean_query_for_spelling(q: &str) -> String {
     let normalized = q
         .replace('“', "")
@@ -15482,6 +15691,7 @@ fn clean_query_for_spelling(q: &str) -> String {
         if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:") || wl.starts_with("before:")
             || wl.starts_with("lang:") || wl.starts_with("intitle:") || wl.starts_with("inurl:") || wl.starts_with("intext:")
             || wl.starts_with("related:") || wl.starts_with("price:")
+            || wl.starts_with("price_min:") || wl.starts_with("price_max:")
         {
             continue;
         }
@@ -15528,6 +15738,37 @@ fn error_chain_is_dns(e: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+async fn json_not_found() -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "not_found", "message": "Unknown route" })),
+    )
+}
+
+/// axum 0.7 emits empty bodies for 404/405 when no fallback exists. Normalize
+/// those framework responses to the same JSON error shape as application errors.
+async fn normalize_framework_errors(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let res = next.run(request).await;
+    let status = res.status();
+    if status != axum::http::StatusCode::NOT_FOUND && status != axum::http::StatusCode::METHOD_NOT_ALLOWED {
+        return res;
+    }
+    let (parts, body) = res.into_parts();
+    let bytes = axum::body::to_bytes(body, 8192).await.unwrap_or_default();
+    if !bytes.is_empty() {
+        return axum::response::Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
+    let (code, message) = if status == axum::http::StatusCode::NOT_FOUND {
+        ("not_found", "Unknown route")
+    } else {
+        ("method_not_allowed", "Method not allowed for this route")
+    };
+    (status, Json(serde_json::json!({ "error": code, "message": message }))).into_response()
+}
+
 fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
     let response = UnifiedResponse {
         query: query.to_string(),
@@ -15558,6 +15799,7 @@ fn make_error_response(query: &str, error_code: &str, message: &str, is_junk: bo
         price_verified: None,
         recall_gap_terms: None,
         shopping: None,
+        snapshot_id: None,
     };
     (
         axum::http::StatusCode::BAD_REQUEST,
@@ -15712,16 +15954,33 @@ async fn handle_search(
         tracing::info!("Spell-corrected query: '{}' -> '{}'", q_trimmed, q_corrected_cleaned);
     }
 
-    // 0b.6: Cache lookup, keyed on the CORRECTED query. Done after correction so
-    // typo variants share one entry (and one upstream fan-out).
-    // `q_corrected_cleaned` is what the engine actually searches, so it is the
-    // right identity for the cached body.
-    let cache_key = format!(
-        "{}:{}:{}",
-        q_corrected_cleaned.to_lowercase(),
-        page_key,
-        geo_key
-    );
+    // 0b.6: Cache lookup, keyed on the CORRECTED query plus an operator
+    // fingerprint from the ORIGINAL query. Typo variants still share an entry;
+    // structural operators never do (they are parsed only after a cache hit).
+    let cache_key = search_cache_key(&q_corrected_cleaned, &q_trimmed, &page_key, &geo_key);
+    // Snapshot page path: reuse an immutable ranked list, so total/has_more and
+    // page contents cannot drift between requests that hit different upstreams.
+    if let Some(id) = params.snapshot_id.as_deref() {
+        if let Some(json) = state.cache.get(&format!("snap:{}", id)) {
+            if let Ok(full) = serde_json::from_str::<Vec<MergedResult>>(&json) {
+                let snap_limit = params.limit.or(params.count).or(params.n).unwrap_or(24);
+                let snap_offset = params.offset.unwrap_or(0);
+                let (page, total, more) = paginate_snapshot(&full, snap_offset, snap_limit);
+                let response = UnifiedResponse {
+                    query: q_trimmed.to_string(),
+                    results: page,
+                    total: Some(total),
+                    page_limit: Some(snap_limit),
+                    page_offset: Some(snap_offset),
+                    has_more: Some(more),
+                    snapshot_id: Some(id.to_string()),
+                    ..Default::default()
+                };
+                return (axum::http::StatusCode::OK, Json(serde_json::to_value(response).unwrap_or_default()));
+            }
+        }
+        tracing::debug!("Snapshot {} missing or expired; running a fresh search", id);
+    }
     if let Some(cached) = state.cache.get(&cache_key) {
         tracing::info!("Cache hit for query: {}", q_corrected_cleaned);
         let value: serde_json::Value = serde_json::from_str(&cached).unwrap_or(serde_json::json!({}));
@@ -15831,6 +16090,7 @@ async fn handle_search(
             if wl.starts_with("site:") || wl.starts_with("filetype:") || wl.starts_with("after:")
                 || wl.starts_with("before:") || wl.starts_with("intitle:") || wl.starts_with("inurl:")
                 || wl.starts_with("intext:") || wl.starts_with("lang:")
+                || wl.starts_with("price_min:") || wl.starts_with("price_max:")
             {
                 reconstructed.push(' ');
                 reconstructed.push_str(w);
@@ -16131,7 +16391,7 @@ async fn handle_search(
         }
     }
 
-    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", q_encoded);
+    let invidious_url = format!("{}/api/v1/search?q={}", invidious_url(), q_encoded);
 
     let indexer_q = if let Some(ref stripped) = stripped_override {
         stripped.clone()
@@ -18050,6 +18310,8 @@ async fn handle_search(
     // web result carries a parseable date. Otherwise keep recency as a scoring
     // boost only (fail-open) — a zero-width 'today' window combined with
     // fabricated URL-year dates would otherwise delete every result.
+    let reported_dates = snapshot_reported_date_bounds(&intent.structured_constraints);
+    let mut date_cleared_for_ranking = false;
     if dated_result_count == 0
         && (intent.structured_constraints.after_date.is_some()
             || intent.structured_constraints.before_date.is_some())
@@ -18059,6 +18321,7 @@ async fn handle_search(
         );
         intent.structured_constraints.after_date = None;
         intent.structured_constraints.before_date = None;
+        date_cleared_for_ranking = true;
     }
     let priced_result_count = web_results.iter().filter(|r| r.get_price().is_some()).count();
 
@@ -18123,6 +18386,7 @@ async fn handle_search(
             );
             intent.structured_constraints.after_date = None;
             intent.structured_constraints.before_date = None;
+            date_cleared_for_ranking = true;
         }
     }
 
@@ -18309,7 +18573,7 @@ async fn handle_search(
                 r
             }).collect();
             // Sort by penalized score to push multi-violation results down
-            scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            sort_results_by(&mut scored_results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
             web_results = scored_results;
         }
     }
@@ -19168,7 +19432,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
             }
         }
         // Re-sort by final score
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
     // Hard filter on all constraints (file types, sites, date bounds, phrases, and negatives) post-merge:
     let pre_hard = results.clone();
@@ -19176,6 +19440,26 @@ let mut results = match tokio::task::spawn_blocking(move || {
     results.retain(|r| {
         !should_filter_by_constraints(&r.title, &r.content, &r.url, r.published_date.as_deref(), &intent.structured_constraints)
     });
+    // FILETYPE: SearXNG does not honour filetype:, so enforce locally. Keep only
+    // results with positive type evidence; if none match, fail open to the
+    // pre-filter set and disclose it (a non-empty page must never become empty).
+    let requested_types = intent.structured_constraints.file_types.clone();
+    if !requested_types.is_empty() {
+        let (kept, fail_open) = apply_filetype_policy(results.clone(), &requested_types, |r| {
+            filetype_evidence(&requested_types, &r.url, &r.title, &r.content)
+        });
+        if fail_open {
+            tracing::warn!(
+                "FILETYPE FAIL-OPEN: no result carried evidence of {:?}; keeping the pre-filter set",
+                requested_types
+            );
+            results = pre_hard.clone();
+            let note = "filetype — operator parsed and reported, but no returned result carried matching type evidence, so no local narrowing was applied".to_string();
+            if !ignored.contains(&note) { ignored.push(note); }
+        } else {
+            results = kept;
+        }
+    }
     // FAIL-OPEN for inurl:/intext: — same never-collapse-to-zero policy as the
     // negative-constraint net below. These two operators are enforced only locally
     // (SearXNG ignores them), so a strict drop can empty the page when no candidate
@@ -19216,7 +19500,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
                 r.score *= 0.25;
             }
         }
-        restored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut restored, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
         results = restored;
     }
 
@@ -19228,7 +19512,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         for r in results.iter_mut() {
             r.score += constraint_boost(&r.title, &r.content, &r.url, &intent.structured_constraints);
         }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        sort_results_by(&mut results, |a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.url.cmp(&b.url)));
     }
 
     // Sanitize content and clamp final score for safe JSON serialization and API spec conformance.
@@ -19356,6 +19640,20 @@ let mut results = match tokio::task::spawn_blocking(move || {
         } else {
             compute_recall_gap_terms(&q_trimmed, &results)
         };
+    // Immutable ranked-list snapshot: store the full post-filter set before
+    // slicing so subsequent pages come from the same list, not a new fan-out.
+    let snapshot_id = snapshot_id_for(
+        &q_trimmed,
+        &geo_key,
+        &search_cache_operator_key(&q_trimmed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    );
+    if let Ok(full_json) = serde_json::to_string(&results) {
+        state.cache.put(format!("snap:{}", snapshot_id), full_json, Duration::from_secs(120));
+    }
     let mut paginated_results = results.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
 
     // Backfill `published_date` from the same resolver the date filter uses
@@ -19409,6 +19707,12 @@ let mut results = match tokio::task::spawn_blocking(move || {
             }
         }
     }
+    restore_reported_date_bounds(
+        &mut intent.structured_constraints,
+        &reported_dates,
+        date_cleared_for_ranking,
+        &mut ignored,
+    );
     let sc = &intent.structured_constraints;
     let mut applied: Vec<String> = Vec::new();
     // NOTE: `ignored` was declared up-front (near the constraint-normalization /
@@ -19795,6 +20099,7 @@ let mut results = match tokio::task::spawn_blocking(move || {
         { Some(priced_result_count) } else { None },
         recall_gap_terms,
         shopping: shopping_block,
+        snapshot_id: Some(snapshot_id),
     };
 
     // Cache for 5 minutes — but never cache empty results
@@ -19835,6 +20140,40 @@ let mut results = match tokio::task::spawn_blocking(move || {
         response_json
     };
     (axum::http::StatusCode::OK, Json(final_json))
+}
+
+/// User-stated date bounds are captured before the date fail-open clears them
+/// for ranking, then restored into the reported constraints. Without this,
+/// `before:` disappeared from `structured_constraints` while `applied_constraints`
+/// still listed it (the same class of bug the price snapshot already fixes).
+#[derive(Clone, Debug)]
+struct ReportedDateBounds {
+    after: Option<String>,
+    before: Option<String>,
+}
+
+fn snapshot_reported_date_bounds(c: &Constraints) -> ReportedDateBounds {
+    ReportedDateBounds { after: c.after_date.clone(), before: c.before_date.clone() }
+}
+
+fn restore_reported_date_bounds(
+    c: &mut Constraints,
+    snap: &ReportedDateBounds,
+    cleared_for_ranking: bool,
+    ignored: &mut Vec<String>,
+) {
+    if snap.after.is_some() && c.after_date.is_none() {
+        c.after_date = snap.after.clone();
+    }
+    if snap.before.is_some() && c.before_date.is_none() {
+        c.before_date = snap.before.clone();
+    }
+    if cleared_for_ranking && (snap.after.is_some() || snap.before.is_some()) {
+        let note = "before:/after: — date bound parsed and reported, but no result carried a usable date, so the window was applied as a scoring boost only (no hard narrowing)".to_string();
+        if !ignored.contains(&note) {
+            ignored.push(note);
+        }
+    }
 }
 
 fn parse_date_constraints(q: &str) -> (Option<String>, Option<String>) {
@@ -20517,6 +20856,20 @@ fn extract_gateway_constraints_uncached(q: &str) -> Constraints {
         }
     }
 
+    // Documented aliases price_min:/price_max: — previously left as literal
+    // positive terms, so no price constraint was extracted at all.
+    for (token, is_min) in [("price_min:", true), ("price_max:", false)] {
+        for cap in q_lower.match_indices(token) {
+            let after = cap.0 + token.len();
+            let rest = &q[after..];
+            let end = rest.find(' ').unwrap_or(rest.len());
+            let val = rest[..end].trim().trim_matches(',').to_lowercase();
+            if let Ok(v) = val.parse::<f32>() {
+                if is_min { price_min = Some(v); } else { price_max = Some(v); }
+            }
+        }
+    }
+
     // Extract lang:
     for cap in q_lower.match_indices("lang:") {
         let after = cap.0 + 5;
@@ -20616,7 +20969,7 @@ fn fallback_positive_terms(q: &str, negative: &[String]) -> Vec<String> {
     // `extract_gateway_constraints`). A token carrying one is an instruction,
     // not a topic — and its payload is already captured in the operator field.
     const OPERATORS: &[&str] = &[
-        "site:", "filetype:", "price:", "after:", "before:", "intitle:", "inurl:",
+        "site:", "filetype:", "price:", "price_min:", "price_max:", "after:", "before:", "intitle:", "inurl:",
         "intext:", "related:", "lang:", "not:",
     ];
 
@@ -21286,6 +21639,37 @@ async fn handle_search_fast(
 }
 
 #[cfg(test)]
+mod invidious_url_tests {
+    use super::*;
+
+    #[test]
+    fn invidious_base_url_defaults_to_loopback_when_unset() {
+        assert_eq!(invidious_base_url(None), "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn invidious_base_url_uses_configured_container_dns() {
+        assert_eq!(
+            invidious_base_url(Some("http://invidious:3000")),
+            "http://invidious:3000"
+        );
+    }
+
+    #[test]
+    fn invidious_base_url_strips_trailing_slash() {
+        assert_eq!(
+            invidious_base_url(Some("http://invidious:3000/")),
+            "http://invidious:3000"
+        );
+    }
+
+    #[test]
+    fn invidious_base_url_ignores_blank_config() {
+        assert_eq!(invidious_base_url(Some("   ")), "http://127.0.0.1:3000");
+    }
+}
+
+#[cfg(test)]
 mod exact_model_gate_tests {
     use super::*;
 
@@ -21685,6 +22069,67 @@ mod constraint_fix_tests {
     fn literal_after_still_parsed() {
         let (after, _) = parse_date_constraints("rust after:2024");
         assert_eq!(after.as_deref(), Some("2024"));
+    }
+
+    #[test]
+    fn filetype_evidence_distinguishes_match_mismatch_unknown() {
+        let ft = vec!["pdf".to_string()];
+        assert_eq!(filetype_evidence(&ft, "https://example.com/paper.pdf", "", ""), FiletypeEvidence::Match);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/paper.docx", "", ""), FiletypeEvidence::Mismatch);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/download?file=report.PDF", "", ""), FiletypeEvidence::Match);
+        assert_eq!(filetype_evidence(&ft, "https://example.com/article", "", "See the PDF document"), FiletypeEvidence::Unknown);
+    }
+
+    #[test]
+    fn filetype_policy_keeps_matches_and_fails_open_when_none() {
+        let ft = vec!["pdf".to_string()];
+        let urls = vec![
+            "https://a.example/report.pdf".to_string(),
+            "https://b.example/index.html".to_string(),
+        ];
+        let (kept, fail_open) = apply_filetype_policy(urls.clone(), &ft, |u| filetype_evidence(&ft, u, "", ""));
+        assert_eq!(kept, vec!["https://a.example/report.pdf".to_string()]);
+        assert!(!fail_open);
+        let none_match = vec!["https://b.example/index.html".to_string()];
+        let (kept2, fail_open2) = apply_filetype_policy(none_match.clone(), &ft, |u| filetype_evidence(&ft, u, "", ""));
+        assert_eq!(kept2, none_match, "a non-empty set must never collapse to zero");
+        assert!(fail_open2);
+    }
+
+    #[test]
+    fn price_min_max_aliases_are_extracted() {
+        let c = extract_gateway_constraints_uncached("laptop price_min:10 price_max:100");
+        assert_eq!(c.price_min, Some(10.0), "price_min: must set price_min");
+        assert_eq!(c.price_max, Some(100.0), "price_max: must set price_max");
+        assert_eq!(c.price_lt, None, "aliases must not masquerade as price:<");
+        assert_eq!(c.price_gt, None);
+    }
+
+    #[test]
+    fn date_fail_open_preserves_reported_before_bound() {
+        let mut c = cst();
+        c.before_date = Some("2025-01-01".to_string());
+        let snap = snapshot_reported_date_bounds(&c);
+        // Simulate the fail-open clearing used for ranking only.
+        c.after_date = None;
+        c.before_date = None;
+        let mut ignored: Vec<String> = Vec::new();
+        restore_reported_date_bounds(&mut c, &snap, true, &mut ignored);
+        assert_eq!(c.before_date.as_deref(), Some("2025-01-01"),
+            "user-stated before: must remain in the reported constraints");
+        assert!(ignored.iter().any(|n| n.contains("before")),
+            "fail-open must be disclosed in ignored_constraints");
+    }
+
+    #[test]
+    fn price_aliases_survive_sanitize_and_are_not_forwarded_upstream() {
+        let mut c = Constraints::default();
+        c.positive = vec!["price_min:10".to_string(), "shoes".to_string()];
+        let clean = sanitize_constraints(&c);
+        assert_eq!(clean.price_min, Some(10.0), "engine-emitted alias must be preserved");
+        let forwarded = preprocess_searxng_query("price_min:10 shoes");
+        assert!(forwarded.contains("shoes"), "topic term must survive");
+        assert!(!forwarded.contains("price_min:"), "operator must not leak upstream");
     }
 
     #[test]
@@ -26807,6 +27252,41 @@ mod negative_constraint_retention_tests {
         );
     }
 
+    #[test]
+    fn sort_by_score_then_url_is_deterministic_for_ties() {
+        #[derive(Clone)]
+        struct Row { url: String, score: f32 }
+        let mut a = vec![
+            Row { url: "https://z.example".into(), score: 0.9 },
+            Row { url: "https://a.example".into(), score: 0.9 },
+            Row { url: "https://m.example".into(), score: 0.8 },
+        ];
+        let mut b = a.clone();
+        b.reverse();
+        let cmp = |x: &Row, y: &Row| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal).then_with(|| x.url.cmp(&y.url));
+        sort_results_by(&mut a, cmp);
+        sort_results_by(&mut b, cmp);
+        let urls: Vec<_> = a.iter().map(|r| r.url.as_str()).collect();
+        let urls_b: Vec<_> = b.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.example", "https://z.example", "https://m.example"]);
+        assert_eq!(urls, urls_b, "equal-score rows must not depend on upstream arrival order");
+    }
+
+    #[tokio::test]
+    async fn parameter_error_envelope_matches_empty_query_envelope() {
+        let p = parameter_error("Invalid value for 'limit': expected a non-negative integer, got 'abc'");
+        let (_, e) = make_error_response("", "empty_query", "Query parameter 'q' is empty", false);
+        let e = e.into_response();
+        let pb = axum::body::to_bytes(p.into_body(), 8192).await.unwrap();
+        let eb = axum::body::to_bytes(e.into_body(), 8192).await.unwrap();
+        let pv: serde_json::Value = serde_json::from_slice(&pb).unwrap();
+        let ev: serde_json::Value = serde_json::from_slice(&eb).unwrap();
+        let mut pk: Vec<String> = pv.as_object().unwrap().keys().cloned().collect();
+        let mut ek: Vec<String> = ev.as_object().unwrap().keys().cloned().collect();
+        pk.sort(); ek.sort();
+        assert_eq!(pk, ek, "all 400 paths must share one envelope");
+    }
+
     #[tokio::test]
     async fn parameter_error_uses_the_documented_envelope() {
         let resp = parameter_error("Invalid value for 'limit': expected a non-negative integer, got 'abc'");
@@ -26835,5 +27315,154 @@ mod negative_constraint_retention_tests {
             "title-dominated result should get score 0.0, got {}",
             score
         );
+    }
+}
+
+#[cfg(test)]
+mod search_cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn search_cache_key_distinguishes_operator_variants() {
+        let base = "quokkajtqpaonp";
+        let plain = search_cache_key(base, base, "all", "none");
+        let after = search_cache_key(base, &format!("after:2024-01-01 {}", base), "all", "none");
+        let site = search_cache_key(base, &format!("site:example.org {}", base), "all", "none");
+        assert_ne!(plain, after, "after: must be part of cache identity");
+        assert_ne!(plain, site, "site: must be part of cache identity");
+        assert_ne!(after, site, "different operators must not share a cache entry");
+    }
+
+    #[test]
+    fn search_cache_key_is_order_case_insensitive_and_shares_typos() {
+        let a = search_cache_key(
+            "biryani recipe",
+            "biryani recipie site:example.org after:2024-01-01",
+            "all", "none");
+        let b = search_cache_key(
+            "biryani recipe",
+            "biryani recipe AFTER:2024-01-01 SITE:example.org",
+            "all", "none");
+        assert_eq!(a, b, "operator order and case must not fragment the cache");
+        assert_ne!(a, search_cache_key("biryani recipe", "biryani recipe", "all", "none"),
+            "bare query must not share an operator query's entry");
+    }
+
+    #[test]
+    fn search_cache_key_partitions_page_geo_and_namespace() {
+        let k = search_cache_key("rust", "rust site:example.org", "all", "none");
+        assert!(k.starts_with("search:"), "key must be namespaced away from media endpoints");
+        assert_ne!(k, search_cache_key("rust", "rust site:example.org", "l10_o0", "none"));
+        assert_ne!(k, search_cache_key("rust", "rust site:example.org", "all", "US"));
+        assert_eq!(k, search_cache_key("RUST", "RUST SITE:example.org", "all", "none"));
+    }
+}
+
+#[cfg(test)]
+mod pagination_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_id_is_stable_and_input_sensitive() {
+        let a = snapshot_id_for("rust", "none", "site:example.org", 1234);
+        assert_eq!(a, snapshot_id_for("rust", "none", "site:example.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "none", "site:other.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "US", "site:example.org", 1234));
+        assert_ne!(a, snapshot_id_for("rust", "none", "site:example.org", 5678));
+    }
+
+    #[test]
+    fn paginate_snapshot_pages_are_stable_and_disjoint() {
+        let items: Vec<String> = (0..25).map(|i| format!("u{}", i)).collect();
+        let (p0, total0, more0) = paginate_snapshot(&items, 0, 5);
+        let (p5, total5, more5) = paginate_snapshot(&items, 5, 5);
+        let (p20, total20, more20) = paginate_snapshot(&items, 20, 5);
+        assert_eq!(p0, items[0..5]);
+        assert_eq!(p5, items[5..10]);
+        assert_eq!(p20, items[20..25]);
+        assert_eq!((total0, total5, total20), (25, 25, 25));
+        assert!(more0 && more5 && !more20);
+        assert!(p0.iter().all(|u| !p5.contains(u)));
+    }
+}
+
+#[cfg(test)]
+mod video_ranking_tests {
+    use super::*;
+
+    #[test]
+    fn video_id_from_url_handles_youtube_and_youtu_be() {
+        assert_eq!(video_id_from_url("https://www.youtube.com/watch?v=abc123"), Some("abc123".to_string()));
+        assert_eq!(video_id_from_url("https://youtu.be/xyz789?t=30"), Some("xyz789".to_string()));
+        assert_eq!(video_id_from_url("https://www.youtube.com/embed/emb456"), Some("emb456".to_string()));
+        assert_eq!(video_id_from_url("https://example.com/article"), None);
+    }
+
+    #[test]
+    fn invidious_result_score_scales_with_title_relevance() {
+        let good = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Rust programming tutorial for beginners".into()),
+            video_id: Some("a".into()),
+            description: Some("Learn Rust programming".into()),
+        };
+        let poor = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Cooking pasta at home".into()),
+            video_id: Some("b".into()),
+            description: None,
+        };
+        let a = invidious_video_result(&good, "rust programming").unwrap();
+        let b = invidious_video_result(&poor, "rust programming").unwrap();
+        assert!(a.score > b.score, "relevant title must score higher");
+        assert!((0.55..=0.95).contains(&a.score), "score must reflect coverage, not a high floor");
+        assert!(b.score < 0.9, "weak matches must not outrank typical web rows");
+    }
+
+    #[test]
+    fn invidious_coverage_ignores_stopwords() {
+        let row = InvidiousResult {
+            result_type: Some("video".into()),
+            title: Some("Rust programming tutorial".into()),
+            video_id: Some("x".into()),
+            description: None,
+        };
+        let plain = invidious_video_result(&row, "rust programming").unwrap().score;
+        let with_stopwords = invidious_video_result(&row, "the rust and programming").unwrap().score;
+        assert_eq!(plain, with_stopwords, "stopwords must not inflate coverage");
+    }
+
+    #[test]
+    fn invidious_result_requires_video_type_and_id() {
+        let no_id = InvidiousResult { result_type: Some("video".into()), title: Some("x".into()), video_id: None, description: None };
+        let channel = InvidiousResult { result_type: Some("channel".into()), title: Some("x".into()), video_id: Some("id".into()), description: None };
+        assert!(invidious_video_result(&no_id, "x").is_none());
+        assert!(invidious_video_result(&channel, "x").is_none());
+    }
+
+    #[test]
+    fn merge_video_results_dedupes_and_mixes_sources() {
+        let web = vec![
+            VideoResult { title: "Rust A".into(), url: "https://www.youtube.com/watch?v=same".into(), description: String::new(), video_id: String::new(), thumbnail: String::new(), source: "bing videos".into(), score: 0.9 },
+            VideoResult { title: "Rust B".into(), url: "https://vimeo.com/2".into(), description: String::new(), video_id: String::new(), thumbnail: String::new(), source: "duckduckgo videos".into(), score: 0.9 },
+        ];
+        let inv = vec![
+            VideoResult { title: "Rust C".into(), url: "https://www.youtube.com/watch?v=same".into(), description: String::new(), video_id: "same".into(), thumbnail: String::new(), source: "invidious".into(), score: 0.95 },
+            VideoResult { title: "Rust D".into(), url: "https://www.youtube.com/watch?v=new".into(), description: String::new(), video_id: "new".into(), thumbnail: String::new(), source: "invidious".into(), score: 0.93 },
+        ];
+        let merged = merge_video_results(web, vec![], inv);
+        assert_eq!(merged.len(), 3, "duplicate videoId must be dropped");
+        assert!(merged.iter().any(|r| r.source == "invidious"), "Invidious must be able to enter the page");
+        assert!(merged[0].score >= merged[1].score && merged[1].score >= merged[2].score);
+    }
+
+    #[test]
+    fn videos_default_to_twenty_results_but_honor_explicit_limit() {
+        assert_eq!(effective_media_limit(None, VIDEOS_DEFAULT_LIMIT), Some(20));
+        assert_eq!(effective_media_limit(Some(5), VIDEOS_DEFAULT_LIMIT), Some(5));
+        let mut value = serde_json::json!({"count": 30, "results": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30]});
+        value = apply_media_limit(value, effective_media_limit(None, VIDEOS_DEFAULT_LIMIT));
+        assert_eq!(value["count"], 20);
+        assert_eq!(value["results"].as_array().unwrap().len(), 20);
     }
 }

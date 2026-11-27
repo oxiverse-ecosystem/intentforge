@@ -157,12 +157,29 @@ services:
     volumes:
       - invidious-db-data:/var/lib/postgresql/data
 
+  # One-shot schema init for a fresh Invidious DB (see dev compose).
+  invidious-migrate:
+    container_name: if-invidious-migrate
+    image: quay.io/invidious/invidious:latest
+    network_mode: "service:gluetun"
+    depends_on:
+      - invidious-db
+    environment:
+      - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
+      - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
+    entrypoint: ["/bin/sh", "-c"]
+    command: 'i=0; while [ $$i -lt 30 ]; do /invidious/invidious --migrate && exit 0; i=$$((i+1)); sleep 2; done; echo "invidious migration failed"; exit 1'
+    restart: "no"
+
   invidious:
     container_name: if-invidious
     image: quay.io/invidious/invidious:latest
     network_mode: "service:gluetun"
     depends_on:
-      - invidious-db
+      invidious-db:
+        condition: service_started
+      invidious-migrate:
+        condition: service_completed_successfully
     environment:
       - INVIDIOUS_DATABASE_URL=postgres://kemal:kemal@localhost:5432/invidious
       - INVIDIOUS_HMAC_KEY=intentforge_v2_invidious_hmac_key_987654321
@@ -236,6 +253,7 @@ services:
       - INTENT_ENGINE_URL=http://localhost:3005
       - SEARXNG_URL=http://localhost:8080
       - SEARXNG2_URL=http://localhost:8081
+      - INVIDIOUS_URL=http://127.0.0.1:3000
       - CRAWLER_URL=http://localhost:5001
       - INDEXER_URL=http://localhost:6000
       # Phase 1 goals: anonymous roadmaps persisted in hosted Supabase.

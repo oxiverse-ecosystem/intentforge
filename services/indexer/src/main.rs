@@ -878,6 +878,25 @@ async fn handle_search(
     Json(results)
 }
 
+/// Recursive byte size of a directory tree. A top-level read_dir sum misses
+/// subdirectory stores entirely (the sled embeddings dir holds >1 GB), so
+/// capacity reporting must descend into children.
+fn dir_size_recursive(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    total += dir_size_recursive(&entry.path());
+                } else {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
+}
+
 async fn handle_stats(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -885,21 +904,32 @@ async fn handle_stats(
     let doc_count = searcher.num_docs();
     let segment_count = searcher.segment_readers().len();
 
-    // Get index directory size
-    let index_size = std::fs::read_dir("./index_data")
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum::<u64>()
-        })
-        .unwrap_or(0);
+    let index_path = std::path::Path::new("./index_data");
+    let index_size = dir_size_recursive(index_path);
+    let embedding_size = dir_size_recursive(&index_path.join("embeddings"));
 
     Json(serde_json::json!({
         "documents": doc_count,
         "segments": segment_count,
         "index_size_bytes": index_size,
         "index_size_mb": (index_size as f64 / 1_048_576.0).round() as u64,
+        "embedding_size_bytes": embedding_size,
+        "embedding_size_mb": (embedding_size as f64 / 1_048_576.0).round() as u64,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_size_recursive_counts_nested_store() {
+        let base = std::env::temp_dir().join(format!("if_stats_test_{}", std::process::id()));
+        let nested = base.join("embeddings");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(base.join("top.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(nested.join("db"), vec![0u8; 250]).unwrap();
+        assert_eq!(dir_size_recursive(&base), 350, "nested sled files must be counted");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
