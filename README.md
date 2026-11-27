@@ -562,6 +562,10 @@ make prod-up
 
 The gateway is exposed at `https://api.oxiverse.com` (configurable in `services/traefik/dynamic/routers.yml`).
 
+### Public Access Without a Public IP
+
+A Cloudflare Tunnel can expose the gateway through a domain you control, with no inbound ports or Traefik certificate management. The `cloudflared` service is opt-in (`--profile tunnel`) and shares gluetun's network namespace. Setup steps, including the dashboard token and public hostname route, are in [docs/CLOUDFLARE_TUNNEL.md](docs/CLOUDFLARE_TUNNEL.md).
+
 ### Environment Variables
 
 | Variable | Required | Description |
