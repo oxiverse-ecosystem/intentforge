@@ -110,6 +110,18 @@ fn indexer_url() -> String {
 fn crawler_url() -> String {
     std::env::var("CRAWLER_URL").unwrap_or_else(|_| "http://127.0.0.1:5001".to_string())
 }
+fn invidious_base_url(configured: Option<&str>) -> String {
+    match configured {
+        Some(value) if !value.trim().is_empty() => {
+            value.trim().trim_end_matches('/').to_string()
+        }
+        _ => "http://127.0.0.1:3000".to_string(),
+    }
+}
+fn invidious_url() -> String {
+    let configured = std::env::var("INVIDIOUS_URL").ok();
+    invidious_base_url(configured.as_deref())
+}
 
 
 fn deserialize_null_as_default<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -14026,7 +14038,7 @@ async fn handle_videos(
     let lang = constraints.language.as_deref();
 
     // Query Invidious and both SearXNG instances (categories=videos) in parallel
-    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", urlencoding::encode(&q));
+    let invidious_url = format!("{}/api/v1/search?q={}", invidious_url(), urlencoding::encode(&q));
     let searx_video_url = searxng_url_with_categories(
         &searxng_url(), &q, "videos", geo_location.as_ref(), lang
     );
@@ -16379,7 +16391,7 @@ async fn handle_search(
         }
     }
 
-    let invidious_url = format!("http://invidious:3000/api/v1/search?q={}", q_encoded);
+    let invidious_url = format!("{}/api/v1/search?q={}", invidious_url(), q_encoded);
 
     let indexer_q = if let Some(ref stripped) = stripped_override {
         stripped.clone()
@@ -21624,6 +21636,37 @@ async fn handle_search_fast(
     }
 
     (axum::http::StatusCode::OK, Json(response))
+}
+
+#[cfg(test)]
+mod invidious_url_tests {
+    use super::*;
+
+    #[test]
+    fn invidious_base_url_defaults_to_loopback_when_unset() {
+        assert_eq!(invidious_base_url(None), "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn invidious_base_url_uses_configured_container_dns() {
+        assert_eq!(
+            invidious_base_url(Some("http://invidious:3000")),
+            "http://invidious:3000"
+        );
+    }
+
+    #[test]
+    fn invidious_base_url_strips_trailing_slash() {
+        assert_eq!(
+            invidious_base_url(Some("http://invidious:3000/")),
+            "http://invidious:3000"
+        );
+    }
+
+    #[test]
+    fn invidious_base_url_ignores_blank_config() {
+        assert_eq!(invidious_base_url(Some("   ")), "http://127.0.0.1:3000");
+    }
 }
 
 #[cfg(test)]

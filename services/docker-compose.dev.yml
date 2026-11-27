@@ -358,6 +358,7 @@ services:
       - INTENTFORGE_DEV_MODE=1
       - SEARXNG_URL=http://searxng:8080
       - SEARXNG2_URL=http://if-dev-searxng2:8081
+      - INVIDIOUS_URL=http://invidious:3000
       - CRAWLER_URL=http://crawler:5001
       - INDEXER_URL=http://indexer:6000
       # Affiliate network keys (ROADMAP item 3). Absent => /shopping degrades to
