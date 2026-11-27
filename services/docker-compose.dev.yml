@@ -350,6 +350,10 @@ services:
     container_name: if-dev-gateway
     mem_limit: 512m
     mem_reservation: 256m
+    # Makefile runs compose from services/, so root .env must be loaded here;
+    # `${VAR}` mappings below would otherwise resolve to empty strings.
+    env_file:
+      - ../.env
     environment:
       - INTENT_ENGINE_URL=http://intent-engine:3005
       # Enables the built-in development API key (`intentforge-dev-key`) that
@@ -365,13 +369,11 @@ services:
       # `affiliate: null` (graceful). Set a value here only to exercise the path
       # locally; NEVER commit real keys. Production keys come from the runtime env.
       - SOVRN_COMMERCE_KEY=dummy-test-key-do-not-use
-      # Optional Supabase integration testing: uncomment and set IF_GOAL_STORE=supabase.
+      # Supabase goal persistence in dev — mirrors production behaviour.
       # Keys come from ../../.env — never commit literal values.
-      # - IF_GOAL_STORE=supabase
-      # - SUPABASE_URL=${SUPABASE_URL}
-      # - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY}
-      # - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY}
-      # - IF_ANON_GOAL_TTL_HOURS=6
+      - IF_GOAL_STORE=supabase
+      # SUPABASE_* keys come from ../.env via env_file — never literal here.
+      - IF_ANON_GOAL_TTL_HOURS=6
     volumes:
       - ./shared-signals:/tmp/vpn-signals
       - ./shared-signals/resolv-gateway.conf:/etc/resolv.conf:ro
