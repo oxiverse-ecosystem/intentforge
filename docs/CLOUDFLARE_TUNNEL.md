@@ -65,7 +65,7 @@ For a small set of real testers, add a Cloudflare **Access application** for the
 
 ## Troubleshooting
 
-- **Tunnel stays Down / `failed to connect`:** the VPN provider may block QUIC/UDP. Change the command in the compose service to `tunnel --no-autoupdate --protocol http2 --loglevel info run` and recreate.
+- **Tunnel stays Down / `failed to connect`:** the compose service forces `--protocol http2` because gluetun's VPN rotation briefly blocks QUIC/UDP (`sendmsg: operation not permitted`). Do not switch back to `auto` on this stack; TCP/443 survives the rotation. Recreate with `docker compose -f docker-compose.dev.yml --profile tunnel up -d --no-deps --force-recreate cloudflared` after changing the command.
 - **502 at the hostname:** the route Service URL must be `http://localhost:4000`; `http://gateway:4000` will not resolve in the shared netns. Confirm the gateway itself responds with `curl -s http://localhost:4000/health` from the `gluetun` container.
 - **`TUNNEL_TOKEN` not applied:** compose reads `../.env` via `env_file` because it is invoked from `services/`; check with `docker exec if-dev-cloudflared printenv TUNNEL_TOKEN` (prints the value — avoid pasting it anywhere).
 - **Recreating `gluetun` orphans netns sharers:** after changing gluetun, force-recreate `cloudflared` and other `network_mode: service:gluetun` containers, then re-check `docker exec <c> readlink /proc/self/ns/net`.

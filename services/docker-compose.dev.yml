@@ -424,7 +424,8 @@ services:
     network_mode: "service:gluetun"
     env_file:
       - ../.env
-    command: tunnel --no-autoupdate --loglevel info run
+    # HTTP/2 over TCP survives VPN rotations; QUIC/UDP is briefly blocked by gluetun.
+    command: tunnel --no-autoupdate --protocol http2 --loglevel info run
     depends_on:
       gluetun:
         condition: service_started
